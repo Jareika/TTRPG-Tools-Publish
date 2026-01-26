@@ -1,0 +1,33 @@
+# ---- Node / build ----
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+dist/
+build/
+
+# ---- Obsidian plugin build output (keep these in release zips, but not in repo if you build locally) ----
+main.js
+main.js.map
+
+# ---- TypeScript build cache ----
+*.tsbuildinfo
+
+# ---- OS ----
+.DS_Store
+Thumbs.db
+
+# ---- IDE ----
+.idea/
+.vscode/
+
+# ---- Local dev vaults / test vaults ----
+vault/
+test-vault/
+.obsidian/
+
+# ---- Optional: ignore local env files ----
+.env
+.env.*
