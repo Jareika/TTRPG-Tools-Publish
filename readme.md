@@ -108,6 +108,7 @@ The Publish runtime renders maps as **read-only interactive maps**:
 - drawings and pattern overlays (baked SVGs)
 - swap pins (right click cycles the frame)
 - ruler / measurement (local, read-only)
+- text layers
 
 Editing markers on Publish is not supported.
 
