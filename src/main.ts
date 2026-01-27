@@ -204,7 +204,7 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
       await this.exportLibraryNote();
     } catch (e) {
       console.warn("TTRPG Tools: Publish: exportLibraryNote failed (continuing with markers).", e);
-      new Notice("TTRPG Tools: Publish: library export failed (see console). Markers will still be generated.", 6000);
+      new Notice("Tttrpg tools: publish: library export failed (see console). Markers will still be generated.", 6000);
     }
 
     // 2) Scan notes for zoommap blocks → collect markersPath set
@@ -654,10 +654,10 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
       const maybeZm = (plugins as { getPlugin?: (id: string) => unknown }).getPlugin?.("zoom-map");
       if (!isRecord(maybeZm)) return null;
 
-      const saveLibraryToPath = (maybeZm as Record<string, unknown>).saveLibraryToPath;
+      const saveLibraryToPath = maybeZm.saveLibraryToPath;
       if (typeof saveLibraryToPath !== "function") return null;
 
-      const settings = (maybeZm as Record<string, unknown>).settings;
+      const settings = maybeZm.settings;
       const libraryFilePath =
         isRecord(settings) && typeof settings.libraryFilePath === "string"
           ? settings.libraryFilePath
