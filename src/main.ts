@@ -25,12 +25,16 @@ interface PublishToolsSettings {
   scanMode: ScanMode;
   publishRoot: string;       // ZoomMap/publish
   assetsNotePath: string;    // ZoomMap/publish/assets.md
+  hideNavFolders: string;    // newline or comma separated folder prefixes
+  includePinLinkedNotesInAssets: boolean;
 }
 
 const DEFAULT_SETTINGS: PublishToolsSettings = {
   scanMode: "publishTrueOnly",
   publishRoot: "ZoomMap/publish",
   assetsNotePath: "ZoomMap/publish/assets.md",
+  hideNavFolders: "",
+  includePinLinkedNotesInAssets: false,
 };
 
 // Minimal interface to call into Zoom Map plugin if installed.
@@ -41,6 +45,15 @@ interface ZoomMapPluginApi {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function parseHideNavFolders(raw: string): string[] {
+  const parts = String(raw ?? "")
+    .split(/[\n,]/g)
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((s) => s.replace(/\\/g, "/").replace(/^\/+/, "").replace(/\/{2,}/g, "/").replace(/\/+$/, ""));
+  return Array.from(new Set(parts));
 }
 
 function fmNumber(fm: Record<string, unknown> | null, key: string): number | undefined {
@@ -58,6 +71,12 @@ function readFrontmatter(text: string): Record<string, unknown> | null {
     return null;
   }
 }
+
+type LibraryLinkIndex = {
+  iconDefaultLinks: Map<string, string>;
+  swapPresets: Map<string, { frameLinks: string[]; frameIconKeys: string[] }>;
+};
+
 
 export default class TtrpgToolsPublishPlugin extends Plugin {
   settings: PublishToolsSettings = DEFAULT_SETTINGS;
@@ -126,7 +145,7 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
     await this.generateAssetsManifest();
     new Notice(
       "TTRPG Tools: Publish: done. Next: Publish changes → select publish.js/publish.css and ZoomMap/publish/assets.md → Add linked → Publish.",
-      9000,
+      15000,
     );
   }
 
@@ -136,14 +155,16 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
 
     const stamp = String(this.manifest.version ?? "");
 
-    const jsBlock = buildPublishJsBlock(stamp);
+    const jsBlock = buildPublishJsBlock(stamp, {
+      hideNavFolders: parseHideNavFolders(this.settings.hideNavFolders),
+    });
     const cssBlock = buildPublishCssBlock();
 
     await this.upsertRootFileBlock(jsPath, ZM_BEGIN_JS, ZM_END_JS, jsBlock);
     await this.upsertRootFileBlock(cssPath, ZM_BEGIN_CSS, ZM_END_CSS, cssBlock);
 
-    new Notice("Publish runtime installed/updated: publish.js + publish.css", 2500);
-    new Notice("Reminder: publish.js works only with a custom domain and must be published.", 6000);
+    new Notice("Publish runtime installed/updated: publish.js + publish.css", 15000);
+    new Notice("Reminder: publish.js works only with a custom domain and must be published.", 15000);
   }
 
   private async upsertRootFileBlock(path: string, begin: string, end: string, block: string): Promise<void> {
@@ -204,7 +225,7 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
       await this.exportLibraryNote();
     } catch (e) {
       console.warn("TTRPG Tools: Publish: exportLibraryNote failed (continuing with markers).", e);
-      new Notice("Tttrpg tools: publish: library export failed (see console). Markers will still be generated.", 6000);
+      new Notice("Tttrpg tools: publish: library export failed (see console). Markers will still be generated.", 15000);
     }
 
     // 2) Scan notes for zoommap blocks → collect markersPath set
@@ -216,7 +237,7 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
       const markerJsonFile = this.resolveVaultFile(markersPath);
 	  const sourceMtime = markerJsonFile?.stat?.mtime;
       if (!markerJsonFile) {
-        new Notice(`TTRPG Tools: Publish: missing marker file: ${markersPath}`, 6000);
+        new Notice(`TTRPG Tools: Publish: missing marker file: ${markersPath}`, 15000);
         continue;
       }
 
@@ -226,7 +247,7 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
       try {
         parsed = JSON.parse(raw);
       } catch {
-        new Notice(`TTRPG Tools: Publish: invalid JSON: ${markersPath}`, 6000);
+        new Notice(`TTRPG Tools: Publish: invalid JSON: ${markersPath}`, 15000);
         continue;
       }
 
@@ -263,7 +284,7 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
 
     new Notice(
       `Generated publish marker notes: ${markerNotePaths.size} (updated: ${updatedMarkerNotes}, unchanged: ${skippedMarkerNotes})`,
-      2500,
+      15000,
     );
   }
 
@@ -280,8 +301,7 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
     if (!libFile) {
       new Notice(
        `TTRPG Tools: Publish: library JSON missing: ${LIB_JSON}. Export it once from Zoom Map settings (Library file path).`,
-         9000,
-        9000,
+        15000,
       );
       return;
     }
@@ -291,7 +311,7 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
     try {
       parsed = JSON.parse(raw);
     } catch {
-      new Notice("Ttrpg tools: publish: library.json is invalid JSON.", 6000);
+      new Notice("Ttrpg tools: publish: library.json is invalid JSON.", 15000);
       return;
     }
 
@@ -312,7 +332,7 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
     });
 
     await this.writeOrUpdateMarkdown(LIB_NOTE, md);
-    new Notice(`Generated: ${LIB_NOTE}`, 2000);
+    new Notice(`Generated: ${LIB_NOTE}`, 15000);
   }
 
   private wrapJsonAsPublishNote(kind: "library" | "markers", obj: unknown, meta?: Record<string, unknown>): string {
@@ -383,6 +403,16 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
       assets.add(this.markerNotePathForMarkersPath(m.markersPath));
       for (const p of m.assetPaths) assets.add(normalizePath(p));
     }
+	
+    const libIndex = this.settings.includePinLinkedNotesInAssets
+      ? await this.buildLibraryLinkIndex(this.resolveZoomMapLibraryJsonPath())
+      : null;
+
+    if (this.settings.includePinLinkedNotesInAssets) {
+      for (const m of maps) {
+        await this.addLinkedNotesFromMarkersJson(m.markersPath, m.notePath, assets, libIndex);
+      }
+    }
 
     // Expand assets by reading marker json (stickers, baked svg, overlays, bases)
     for (const m of maps) {
@@ -427,8 +457,8 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
 
     await this.writeOrUpdateMarkdown(notePath, lines.join("\n"));
 
-    new Notice(`Generated: ${notePath}`, 2500);
-    new Notice("Next: Publish changes → select ZoomMap/publish/assets.md → Add linked → Publish.", 8000);
+    new Notice(`Generated: ${notePath}`, 15000);
+    new Notice("Next: Publish changes → select ZoomMap/publish/assets.md → Add linked → Publish.", 15000);
   }
 
   private async scanZoommaps(): Promise<Array<{ notePath: string; markersPath: string; assetPaths: string[] }>> {
@@ -654,17 +684,17 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
       const maybeZm = (plugins as { getPlugin?: (id: string) => unknown }).getPlugin?.("zoom-map");
       if (!isRecord(maybeZm)) return null;
 
-      const saveLibraryToPath = maybeZm.saveLibraryToPath;
-      if (typeof saveLibraryToPath !== "function") return null;
+      const fn = maybeZm.saveLibraryToPath;
+      if (typeof fn !== "function") return null;
 
-      const settings = maybeZm.settings;
+	  const settings = maybeZm.settings;
       const libraryFilePath =
         isRecord(settings) && typeof settings.libraryFilePath === "string"
           ? settings.libraryFilePath
           : undefined;
 
       return {
-        saveLibraryToPath: saveLibraryToPath as (path: string) => Promise<void>,
+        saveLibraryToPath: (path: string) => (fn as (p: string) => Promise<void>)(path),
         libraryFilePath,
       };
     } catch (e) {
@@ -690,6 +720,168 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
     }
     await this.app.vault.create(path, content);
   }
+  
+  private stripWikiBrackets(s: string): string {
+    const t = String(s ?? "").trim();
+    if (t.startsWith("[[") && t.endsWith("]]")) return t.slice(2, -2).trim();
+    return t;
+  }
+
+  private normalizeLinkTarget(raw: string): string {
+    let s = this.stripWikiBrackets(raw);
+    if (!s) return "";
+    if (/^https?:\/\//i.test(s)) return "";
+    const pipe = s.indexOf("|");
+    if (pipe >= 0) s = s.slice(0, pipe).trim();
+    const hash = s.indexOf("#");
+    if (hash >= 0) s = s.slice(0, hash).trim();
+    const block = s.indexOf("^");
+    if (block >= 0) s = s.slice(0, block).trim();
+    return s;
+  }
+
+  private resolveLinkedNotePath(link: string, fromNotePath: string): string | null {
+    const target = this.normalizeLinkTarget(link);
+    if (!target) return null;
+
+    const byPath = this.app.vault.getAbstractFileByPath(normalizePath(target));
+    if (byPath instanceof TFile && byPath.extension?.toLowerCase() === "md") {
+      return byPath.path;
+    }
+
+    const dest = this.app.metadataCache.getFirstLinkpathDest(target, fromNotePath);
+    if (dest instanceof TFile && dest.extension?.toLowerCase() === "md") {
+      return dest.path;
+    }
+
+    return null;
+  }
+
+  private async buildLibraryLinkIndex(libraryJsonPath: string): Promise<LibraryLinkIndex> {
+    const iconDefaultLinks = new Map<string, string>();
+    const swapPresets = new Map<string, { frameLinks: string[]; frameIconKeys: string[] }>();
+
+    const af = this.resolveVaultFile(libraryJsonPath);
+    if (!af) {
+      return { iconDefaultLinks, swapPresets };
+    }
+
+    try {
+      const raw = await this.app.vault.read(af);
+      const obj = JSON.parse(raw) as Record<string, unknown>;
+
+      const icons = Array.isArray(obj.icons) ? (obj.icons as unknown[]) : [];
+      for (const it of icons) {
+        if (!it || typeof it !== "object") continue;
+        const key = (it as { key?: unknown }).key;
+        const dl = (it as { defaultLink?: unknown }).defaultLink;
+        if (typeof key === "string" && key.trim() && typeof dl === "string" && dl.trim()) {
+          iconDefaultLinks.set(key.trim(), dl.trim());
+        }
+      }
+
+      const cols = Array.isArray(obj.baseCollections) ? (obj.baseCollections as unknown[]) : [];
+      for (const c of cols) {
+        if (!isRecord(c)) continue;
+        const include = c.include;
+        if (!isRecord(include)) continue;
+
+        const swapPinsRaw = include.swapPins;
+        const swapPins = Array.isArray(swapPinsRaw) ? swapPinsRaw : [];
+        for (const sp of swapPins) {
+          if (!isRecord(sp)) continue;
+          const id = sp.id;
+          if (typeof id !== "string" || !id.trim()) continue;
+
+          const framesRaw = sp.frames;
+          const frames = Array.isArray(framesRaw) ? framesRaw : [];
+          const frameLinks: string[] = [];
+          const frameIconKeys: string[] = [];
+          for (const fr of frames) {
+            if (!isRecord(fr)) continue;
+            const iconKey = fr.iconKey;
+            const link = fr.link;
+            if (typeof iconKey === "string" && iconKey.trim()) frameIconKeys.push(iconKey.trim());
+            if (typeof link === "string" && link.trim()) frameLinks.push(link.trim());
+          }
+
+          const prev = swapPresets.get(id.trim());
+          if (!prev) {
+            swapPresets.set(id.trim(), { frameLinks, frameIconKeys });
+          } else {
+            prev.frameLinks.push(...frameLinks);
+            prev.frameIconKeys.push(...frameIconKeys);
+          }
+        }
+      }
+    } catch {
+      return { iconDefaultLinks, swapPresets };
+    }
+
+    for (const v of swapPresets.values()) {
+      v.frameLinks = Array.from(new Set(v.frameLinks.filter(Boolean)));
+      v.frameIconKeys = Array.from(new Set(v.frameIconKeys.filter(Boolean)));
+    }
+
+    return { iconDefaultLinks, swapPresets };
+  }
+
+  private async addLinkedNotesFromMarkersJson(
+    markersPath: string,
+    fromNotePath: string,
+    assets: Set<string>,
+    libIndex: LibraryLinkIndex | null,
+  ): Promise<void> {
+    const af = this.resolveVaultFile(markersPath);
+    if (!af) return;
+
+    let data: Record<string, unknown>;
+    try {
+      const raw = await this.app.vault.read(af);
+      data = JSON.parse(raw) as Record<string, unknown>;
+    } catch {
+      return;
+    }
+
+    const addLink = (rawLink: string) => {
+      const p = this.resolveLinkedNotePath(rawLink, fromNotePath);
+      if (p) assets.add(normalizePath(p));
+    };
+
+    const markers = Array.isArray(data.markers) ? (data.markers as unknown[]) : [];
+    for (const mm of markers) {
+      if (!mm || typeof mm !== "object") continue;
+      const m = mm as Record<string, unknown>;
+
+      const link = m.link;
+      if (typeof link === "string" && link.trim()) addLink(link);
+
+      const type = m.type;
+      if (type !== "swap") {
+        continue;
+      }
+
+      const swapLinks = m.swapLinks;
+      if (swapLinks && typeof swapLinks === "object") {
+        for (const v of Object.values(swapLinks as Record<string, unknown>)) {
+          if (typeof v === "string" && v.trim()) addLink(v);
+        }
+      }
+
+      const swapKey = m.swapKey;
+      if (!libIndex) continue;
+      if (typeof swapKey !== "string" || !swapKey.trim()) continue;
+
+      const preset = libIndex.swapPresets.get(swapKey.trim());
+      if (preset) {
+        for (const l of preset.frameLinks) addLink(l);
+        for (const iconKey of preset.frameIconKeys) {
+          const dl = libIndex.iconDefaultLinks.get(iconKey);
+          if (dl) addLink(dl);
+        }
+      }
+    }
+  } 
 }
 
 class PublishToolsSettingTab extends PluginSettingTab {
@@ -737,6 +929,31 @@ class PublishToolsSettingTab extends PluginSettingTab {
         t.setValue(this.plugin.settings.assetsNotePath);
         t.onChange(async (v) => {
           this.plugin.settings.assetsNotePath = normalizePath(v.trim() || "ZoomMap/publish/assets.md");
+          await this.plugin.saveSettings();
+        });
+      });
+	  
+    new Setting(containerEl)
+      .setName("Assets: include linked notes from pins")
+      .setDesc("Optional. If enabled, the assets manifest also includes all notes linked from markers (pins, swap pins, ping pins, etc.).")
+      .addToggle((t) => {
+        t.setValue(!!this.plugin.settings.includePinLinkedNotesInAssets);
+        t.onChange(async (v) => {
+          this.plugin.settings.includePinLinkedNotesInAssets = v;
+          await this.plugin.saveSettings();
+        });
+      });
+	  
+    new Setting(containerEl).setName("Hide").setHeading();
+
+    new Setting(containerEl)
+      .setName("Hide folders in publish navigation")
+      .setDesc("One per line or comma separated. Notes stay published and hover previews still work.")
+      .addTextArea((t) => {
+        t.setPlaceholder("Gm/secrets\narchive");
+        t.setValue(this.plugin.settings.hideNavFolders ?? "");
+        t.onChange(async (v) => {
+          this.plugin.settings.hideNavFolders = v ?? "";
           await this.plugin.saveSettings();
         });
       });
