@@ -27,3 +27,9 @@ export function hashPathToId(path: string): string {
   const norm = normalizeForHash(path);
   return fnv1a32(norm).toString(36);
 }
+
+// Hash for non-path identifiers (e.g. timeline names)
+export function hashKeyToId(key: string): string {
+  const norm = String(key ?? "").trim().toLowerCase();
+  return fnv1a32(norm).toString(36);
+}

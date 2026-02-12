@@ -4,12 +4,13 @@ import {
   PluginSettingTab,
   Setting,
   TFile,
+  TFolder,
   normalizePath,
   parseYaml,
 } from "obsidian";
 import type { App } from "obsidian";
 
-import { hashPathToId, normalizeForHash } from "./hash";
+import { hashKeyToId, hashPathToId, normalizeForHash } from "./hash";
 import {
   ZM_BEGIN_CSS,
   ZM_BEGIN_JS,
@@ -27,6 +28,23 @@ interface PublishToolsSettings {
   assetsNotePath: string;    // ZoomMap/publish/assets.md
   hideNavFolders: string;    // newline or comma separated folder prefixes
   includePinLinkedNotesInAssets: boolean;
+  
+  // Publish website hover popover size (affects page preview popovers)
+  hoverPopoverMaxWidth: string;   // e.g. 720px
+  
+  // Timeline publish
+  timelineScanMode: ScanMode;
+  timelineRoot: string;         // Timeline/publish
+  timelineAssetsNotePath: string; // Timeline/publish/assets.md
+  timelineDateKey: string;      // fc-date
+  timelineEndKey: string;       // fc-end
+  timelineListKey: string;      // timelines
+  timelineTitleKey: string;     // tl-title
+  timelineSummaryKey: string;   // tl-summary
+  timelineImageKey: string;     // tl-image
+  
+  timelineUseSimpleTimelineMonths: boolean;
+  timelineMonthOverridesYaml: string;
 }
 
 const DEFAULT_SETTINGS: PublishToolsSettings = {
@@ -35,7 +53,29 @@ const DEFAULT_SETTINGS: PublishToolsSettings = {
   assetsNotePath: "ZoomMap/publish/assets.md",
   hideNavFolders: "",
   includePinLinkedNotesInAssets: false,
+  
+  hoverPopoverMaxWidth: "720px",
+  
+  timelineScanMode: "publishTrueOnly",
+  timelineRoot: "Timeline/publish",
+  timelineAssetsNotePath: "Timeline/publish/assets.md",
+  timelineDateKey: "fc-date",
+  timelineEndKey: "fc-end",
+  timelineListKey: "timelines",
+  timelineTitleKey: "tl-title",
+  timelineSummaryKey: "tl-summary",
+  timelineImageKey: "tl-image",
+  
+  timelineUseSimpleTimelineMonths: true,
+  timelineMonthOverridesYaml: "",
 };
+
+function normalizeCssSizeValue(raw: string, fallback: string): string {
+  const s = String(raw ?? "").trim();
+  if (!s) return fallback;
+  if (/^\d+(\.\d+)?$/.test(s)) return `${s}px`;
+  return s;
+}
 
 // Minimal interface to call into Zoom Map plugin if installed.
 interface ZoomMapPluginApi {
@@ -77,6 +117,35 @@ type LibraryLinkIndex = {
   swapPresets: Map<string, { frameLinks: string[]; frameIconKeys: string[] }>;
 };
 
+type Ymd = { y: number; m: number; d: number };
+type TimelineEntry = {
+  notePath: string; // vault path to note
+  title: string;
+  summary?: string;
+  start: Ymd;
+  end?: Ymd;
+  img?: string; // url or vault path
+  dateText?: string; // baked display string (uses custom months from settings)
+};
+
+function ymdSortKey(v: Ymd): number {
+  return v.y * 10000 + v.m * 100 + v.d;
+}
+
+function splitTimelineNames(raw: unknown): string[] {
+  if (Array.isArray(raw)) {
+    return raw.map((x) => String(x ?? "").trim()).filter(Boolean);
+  }
+  if (typeof raw === "string") {
+    return raw
+      .replace(/[\]["]/g, "")
+      .split(/[,;\n]+/g)
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+  return [];
+}
+
 
 export default class TtrpgToolsPublishPlugin extends Plugin {
   settings: PublishToolsSettings = DEFAULT_SETTINGS;
@@ -107,6 +176,30 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
       name: "Maps: prepare publish (runtime + data notes + assets)",
       callback: () => void this.prepareAll(),
     });
+	
+    this.addCommand({
+      id: "timeline-publish-generate-data-notes",
+      name: "Timeline: generate publish data notes",
+      callback: () => void this.generateTimelineDataNotes(),
+    });
+
+    this.addCommand({
+      id: "timeline-publish-generate-assets",
+      name: "Timeline: generate publish assets manifest note",
+      callback: () => void this.generateTimelineAssetsManifest(),
+    });
+
+    this.addCommand({
+      id: "timeline-publish-prepare",
+      name: "Timeline: prepare publish (runtime + data notes + assets)",
+      callback: () => void this.prepareTimelineOnly(),
+    });
+
+    this.addCommand({
+      id: "publish-prepare-maps-and-timeline",
+      name: "Prepare publish (maps + timeline)",
+      callback: () => void this.prepareMapsAndTimeline(),
+    });
 
     this.addSettingTab(new PublishToolsSettingTab(this.app, this));
   }
@@ -124,6 +217,14 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
     return normalizePath(this.settings.publishRoot || DEFAULT_SETTINGS.publishRoot);
   }
   
+  private timelineRoot(): string {
+    return normalizePath(this.settings.timelineRoot || DEFAULT_SETTINGS.timelineRoot);
+  }
+
+  private timelineAssetsNotePath(): string {
+    return normalizePath(this.settings.timelineAssetsNotePath || DEFAULT_SETTINGS.timelineAssetsNotePath);
+  }
+  
   private resolveZoomMapLibraryJsonPath(): string {
     const api = this.getZoomMapPluginApi();
     const p = (api?.libraryFilePath ?? "").trim();
@@ -138,6 +239,17 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
     const id = hashPathToId(markersPath);
     return normalizePath(`${this.publishRoot()}/markers/m-${id}.md`);
   }
+  
+  private timelineDataNotePathForTimelineName(name: string): string {
+    const id = hashKeyToId(name);
+    return normalizePath(`${this.timelineRoot()}/timelines/t-${id}.md`);
+  }
+
+  private timelineDataNoteKeyForTimelineName(name: string): string {
+    // for runtime fetchNoteJson(): pass without .md
+    const id = hashKeyToId(name);
+    return normalizePath(`${this.timelineRoot()}/timelines/t-${id}`);
+  }
 
   private async prepareAll(): Promise<void> {
     await this.installPublishRuntime();
@@ -148,17 +260,49 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
       15000,
     );
   }
+  
+  private async prepareTimelineOnly(): Promise<void> {
+    await this.installPublishRuntime();
+    await this.generateTimelineDataNotes();
+    await this.generateTimelineAssetsManifest();
+    new Notice(
+      "TTRPG Tools: Publish: Timeline done. Next: Publish changes → select publish.js/publish.css and Timeline assets note → Add linked → Publish.",
+      15000,
+    );
+  }
+
+  private async prepareMapsAndTimeline(): Promise<void> {
+    await this.installPublishRuntime();
+    await this.generatePublishDataNotes();
+    await this.generateAssetsManifest();
+    await this.generateTimelineDataNotes();
+    await this.generateTimelineAssetsManifest();
+    new Notice("Ttrpg tools: publish: maps + timeline done.", 15000);
+  }
 
   private async installPublishRuntime(): Promise<void> {
     const jsPath = "publish.js";
     const cssPath = "publish.css";
 
     const stamp = String(this.manifest.version ?? "");
+	
+    const popoverW = normalizeCssSizeValue(
+      this.settings.hoverPopoverMaxWidth,
+      DEFAULT_SETTINGS.hoverPopoverMaxWidth,
+    );
 
     const jsBlock = buildPublishJsBlock(stamp, {
       hideNavFolders: parseHideNavFolders(this.settings.hideNavFolders),
+      mapRoot: this.publishRoot(),
+      timelineRoot: this.timelineRoot(),
+      hoverPopoverMaxWidth: popoverW,
     });
-    const cssBlock = buildPublishCssBlock();
+    const cssBlock = buildPublishCssBlock({
+      hoverPopoverMaxWidth: normalizeCssSizeValue(
+        this.settings.hoverPopoverMaxWidth,
+        DEFAULT_SETTINGS.hoverPopoverMaxWidth,
+      ),
+    });
 
     await this.upsertRootFileBlock(jsPath, ZM_BEGIN_JS, ZM_END_JS, jsBlock);
     await this.upsertRootFileBlock(cssPath, ZM_BEGIN_CSS, ZM_END_CSS, cssBlock);
@@ -335,11 +479,11 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
     new Notice(`Generated: ${LIB_NOTE}`, 15000);
   }
 
-  private wrapJsonAsPublishNote(kind: "library" | "markers", obj: unknown, meta?: Record<string, unknown>): string {
+  private wrapJsonAsPublishNote(kind: "library" | "markers" | "timeline", obj: unknown, meta?: Record<string, unknown>): string {
     const fm: Record<string, unknown> = {
       publish: true,
-      ttrpgtools: "ttrpgtools-maps-publish",
-      zoommapData: kind,
+      ttrpgtools: "ttrpgtools-publish",
+      ttrpgtoolsData: kind,
       ...(meta ?? {}),
       generatedAt: new Date().toISOString(),
     };
@@ -387,6 +531,426 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
         console.warn("Zoom Map Publish: failed to delete old marker note", f.path, e);
       }
     }
+  }
+  
+  // =========================
+  // Timeline publish (data notes)
+  // =========================
+
+  private parseFcDate(val: unknown): Ymd | null {
+    if (!val) return null;
+
+    if (typeof val === "string") {
+      const m = val.trim().match(/^(\d{1,6})-(\d{1,2})-(\d{1,2})/);
+      if (!m) return null;
+      return { y: Number(m[1]), m: Number(m[2]), d: Number(m[3]) };
+    }
+
+    if (isRecord(val)) {
+      const y = Number(val.year);
+      const mo = Number(val.month);
+      const d = Number(val.day);
+      if (!Number.isFinite(y) || !Number.isFinite(mo) || !Number.isFinite(d)) return null;
+      return { y, m: mo, d };
+    }
+
+    return null;
+  }
+  
+  private defaultMonths(): string[] {
+    return [
+      "January",
+      "February",
+      "March",
+      "April",
+      "May",
+      "June",
+      "July",
+      "August",
+      "September",
+      "October",
+      "November",
+      "December",
+    ];
+  }
+
+  private parseTimelineMonthOverrides(): Record<string, string[]> {
+    const raw = String(this.settings.timelineMonthOverridesYaml ?? "").trim();
+    if (!raw) return {};
+    try {
+      const parsed = parseYaml(raw) as unknown;
+      if (!isRecord(parsed)) return {};
+      const out: Record<string, string[]> = {};
+      for (const [k, v] of Object.entries(parsed)) {
+        if (typeof k !== "string" || !k.trim()) continue;
+        if (Array.isArray(v)) {
+          const arr = v.map((x) => String(x ?? "").trim()).filter(Boolean);
+          if (arr.length) out[k.trim()] = arr;
+        } else if (typeof v === "string" && v.trim()) {
+          const arr = v
+            .split(",")
+            .map((s) => s.trim())
+            .filter(Boolean);
+          if (arr.length) out[k.trim()] = arr;
+        }
+      }
+      return out;
+    } catch {
+      return {};
+    }
+  }
+
+  private tryGetSimpleTimelineMonths(timelineName: string): string[] | null {
+    if (!this.settings.timelineUseSimpleTimelineMonths) return null;
+    const plugins = (this.app as unknown as { plugins?: unknown }).plugins;
+    if (!isRecord(plugins)) return null;
+
+    const getPlugin = plugins["getPlugin"];
+    let st: unknown = null;
+    if (typeof getPlugin === "function") {
+      try {
+        st = (getPlugin as (id: string) => unknown).call(plugins, "simple-timeline");
+      } catch {
+        st = null;
+      }
+    }
+
+    const pluginsMap = plugins["plugins"];
+    if (!st && isRecord(pluginsMap)) {
+      st = pluginsMap["simple-timeline"] ?? null;
+    }
+
+    if (!isRecord(st)) return null;
+
+    const normalizeMonths = (v: unknown): string[] | null => {
+      if (Array.isArray(v)) {
+        const arr = v.map((x) => String(x ?? "").trim()).filter(Boolean);
+        return arr.length ? arr : null;
+      }
+      if (typeof v === "string" && v.trim()) {
+        const arr = v.split(",").map((s) => s.trim()).filter(Boolean);
+        return arr.length ? arr : null;
+      }
+      return null;
+    };
+
+    const getMonthsFn = st["getMonths"];
+    if (typeof getMonthsFn === "function") {
+      try {
+        const res = (getMonthsFn as (key?: string) => unknown).call(st, timelineName);
+        const arr = normalizeMonths(res);
+        if (arr && arr.length > 0) return arr;
+      } catch {
+        // No empty.
+      }
+    }
+
+    const settings = st["settings"];
+    if (isRecord(settings)) {
+      const tlCfgs = settings["timelineConfigs"];
+      if (isRecord(tlCfgs)) {
+        const cfgMaybe = tlCfgs[timelineName];
+        if (isRecord(cfgMaybe)) {
+          const months = cfgMaybe["months"];
+          const arr = normalizeMonths(months);
+          if (arr && arr.length > 0) return arr;
+        }
+      }
+
+      const legacy = settings["monthOverrides"];
+      if (isRecord(legacy) && Object.prototype.hasOwnProperty.call(legacy, timelineName)) {
+        const arr = normalizeMonths(legacy[timelineName]);
+        if (arr && arr.length > 0) return arr;
+      }
+    }
+
+    return null;
+  }
+
+  private getTimelineMonths(timelineName: string, overrides: Record<string, string[]>): string[] {
+    const ov = overrides[timelineName];
+    if (Array.isArray(ov) && ov.length > 0) return ov;
+
+    const st = this.tryGetSimpleTimelineMonths(timelineName);
+    if (st && st.length > 0) return st;
+
+    return this.defaultMonths();
+  }
+
+  private formatRangeWithMonths(months: string[], start: Ymd, end?: Ymd): string {
+    const mName = (m: number) => months[(m - 1 + months.length) % months.length] ?? String(m);
+    const fmt = (x: Ymd) => `${x.d} ${mName(x.m)} ${x.y}`;
+    if (!end) return fmt(start);
+    if (start.y === end.y && start.m === end.m && start.d === end.d) return fmt(start);
+    if (start.y === end.y && start.m === end.m) return `${start.d}–${end.d} ${mName(start.m)} ${start.y}`;
+    return `${fmt(start)} – ${fmt(end)}`;
+  }
+
+  private resolveInternalAttachmentPath(raw: string, fromPath: string): string | null {
+    const s = String(raw ?? "").trim();
+    if (!s) return null;
+    if (/^https?:\/\//i.test(s) || /^data:/i.test(s)) return null;
+
+    const stripped = s.startsWith("[[") && s.endsWith("]]") ? s.slice(2, -2).trim() : s;
+    const pipe = stripped.indexOf("|");
+    const link = pipe >= 0 ? stripped.slice(0, pipe).trim() : stripped;
+
+    const dest = this.app.metadataCache.getFirstLinkpathDest(link, fromPath);
+    if (dest instanceof TFile) return dest.path;
+
+    // maybe already a path
+    const byPath = this.app.vault.getAbstractFileByPath(normalizePath(link));
+    return byPath instanceof TFile ? byPath.path : null;
+  }
+
+  private pickTimelineImagePath(file: TFile, fm: Record<string, unknown>): string | undefined {
+    const key = this.settings.timelineImageKey || "tl-image";
+    const fmImage = fm[key];
+    if (typeof fmImage === "string" && fmImage.trim()) {
+      const internal = this.resolveInternalAttachmentPath(fmImage, file.path);
+      return internal ?? fmImage.trim(); // keep URL as-is
+    }
+
+    const cache = this.app.metadataCache.getFileCache(file);
+    const exts = /\.(png|jpe?g|webp|gif|avif|bmp|svg)$/i;
+
+    for (const e of cache?.embeds ?? []) {
+      if (exts.test(e.link)) {
+        const internal = this.resolveInternalAttachmentPath(e.link, file.path);
+        if (internal) return internal;
+      }
+    }
+    for (const l of cache?.links ?? []) {
+      if (exts.test(l.link)) {
+        const internal = this.resolveInternalAttachmentPath(l.link, file.path);
+        if (internal) return internal;
+      }
+    }
+
+    // fallback: first image in same folder
+    const parent = file.parent;
+    if (parent instanceof TFolder) {
+      for (const ch of parent.children) {
+        if (ch instanceof TFile && exts.test(ch.name)) return ch.path;
+      }
+    }
+
+    return undefined;
+  }
+
+  private async extractFirstParagraph(file: TFile): Promise<string | undefined> {
+    try {
+      const raw = await this.app.vault.read(file);
+      const text = raw.replace(/^---[\s\S]*?---\s*/m, "");
+      const paras = text
+        .split(/\r?\n\s*\r?\n/)
+        .map((p) => p.trim())
+        .filter(Boolean);
+
+      for (const p of paras) {
+        if (/^(#{1,6}\s|>\s|[-*+]\s|\d+\.\s)/.test(p)) continue;
+        let clean = p
+          .replace(/!\[[^\]]*\]\([^)]+\)/g, "")
+          .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+          .replace(/`{1,3}[^`]*`{1,3}/g, "")
+          .replace(/[*_~]/g, "")
+          .replace(/\s+/g, " ")
+          .trim();
+
+        if (clean) {
+          if (clean.length > 500) clean = `${clean.slice(0, 497)}…`;
+          return clean;
+        }
+      }
+    } catch (e) {
+      console.warn("TTRPG Tools: Publish: extractFirstParagraph failed", e);
+    }
+    return undefined;
+  }
+
+  private async scanTimelineEntries(): Promise<Array<{ timelines: string[]; entry: TimelineEntry; imgInternal?: string }>> {
+    const files = this.app.vault.getMarkdownFiles();
+    const out: Array<{ timelines: string[]; entry: TimelineEntry; imgInternal?: string }> = [];
+
+    const dateKey = this.settings.timelineDateKey || "fc-date";
+    const endKey = this.settings.timelineEndKey || "fc-end";
+    const listKey = this.settings.timelineListKey || "timelines";
+    const titleKey = this.settings.timelineTitleKey || "tl-title";
+    const summaryKey = this.settings.timelineSummaryKey || "tl-summary";
+
+    for (const f of files) {
+      if (this.settings.timelineScanMode === "publishTrueOnly") {
+        const fmPub = this.app.metadataCache.getFileCache(f)?.frontmatter as Record<string, unknown> | undefined;
+        if (fmPub?.publish !== true) continue;
+      }
+
+      const fm = this.app.metadataCache.getFileCache(f)?.frontmatter as Record<string, unknown> | undefined;
+      if (!fm) continue;
+
+      const start = this.parseFcDate(fm[dateKey]);
+      if (!start) continue;
+
+      const timelines = splitTimelineNames(fm[listKey]);
+      if (!timelines.length) continue;
+
+      const end = fm[endKey] ? this.parseFcDate(fm[endKey]) ?? undefined : undefined;
+
+      const title = typeof fm[titleKey] === "string" && fm[titleKey].trim() ? fm[titleKey].trim() : f.basename;
+
+      let summary: string | undefined;
+      // Important: allow "intentionally empty" summaries:
+      // If tl-summary exists in frontmatter (even empty), do NOT auto-extract.
+      if (Object.prototype.hasOwnProperty.call(fm, summaryKey)) {
+        const v = fm[summaryKey];
+        if (typeof v === "string") {
+          summary = v; // keep as-is (can be "")
+        } else if (typeof v === "number" || typeof v === "boolean") {
+          summary = String(v);
+        } else if (v == null) {
+          summary = "";
+        } else {
+          // Avoid "[object Object]" (eslint: no-base-to-string)
+          try {
+            summary = JSON.stringify(v);
+          } catch {
+            summary = "";
+          }
+        }
+      } else {
+        summary = await this.extractFirstParagraph(f);
+      }
+
+      const img = this.pickTimelineImagePath(f, fm);
+      const imgInternal = img ? this.resolveInternalAttachmentPath(img, f.path) ?? undefined : undefined;
+
+      out.push({
+        timelines,
+        imgInternal,
+        entry: {
+          notePath: f.path,
+          title,
+          summary,
+          start,
+          end,
+          img,
+        },
+      });
+    }
+
+    return out;
+  }
+
+  private async cleanupTimelineNotes(keep: Set<string>): Promise<void> {
+    const folder = normalizePath(`${this.timelineRoot()}/timelines`);
+    const files = this.app.vault.getMarkdownFiles().filter((f) => f.path.startsWith(folder + "/"));
+    for (const f of files) {
+      if (!f.name.startsWith("t-")) continue;
+      if (keep.has(f.path)) continue;
+      try {
+        await this.app.fileManager.trashFile(f);
+      } catch (e) {
+        console.warn("Timeline Publish: failed to delete old timeline note", f.path, e);
+      }
+    }
+  }
+
+  private async generateTimelineDataNotes(): Promise<void> {
+    const root = this.timelineRoot();
+    await this.ensureFolderFor(normalizePath(`${root}/timelines/x.md`));
+
+    const scanned = await this.scanTimelineEntries();
+    const byTimeline = new Map<string, TimelineEntry[]>();
+    const keepPaths = new Set<string>();
+	const monthOverrides = this.parseTimelineMonthOverrides();
+
+    for (const it of scanned) {
+      for (const tl of it.timelines) {
+        const arr = byTimeline.get(tl) ?? [];
+        arr.push({ ...it.entry });
+        byTimeline.set(tl, arr);
+      }
+    }
+
+    for (const [name, entries] of byTimeline.entries()) {
+      const months = this.getTimelineMonths(name, monthOverrides);
+
+      for (const e of entries) {
+        e.dateText = this.formatRangeWithMonths(months, e.start, e.end);
+      }
+
+      entries.sort((a, b) => ymdSortKey(a.start) - ymdSortKey(b.start));
+
+      const notePath = this.timelineDataNotePathForTimelineName(name);
+      keepPaths.add(notePath);
+
+      const payload = {
+        timelineName: name,
+        months,
+        entries,
+      };
+
+      const md = this.wrapJsonAsPublishNote("timeline", payload, {
+        timelineName: name,
+        timelineKey: this.timelineDataNoteKeyForTimelineName(name),
+      });
+
+      await this.writeOrUpdateMarkdown(notePath, md);
+    }
+
+    await this.cleanupTimelineNotes(keepPaths);
+    new Notice(`Generated timeline data notes: ${byTimeline.size}`, 15000);
+  }
+
+  // =========================
+  // Timeline publish (assets)
+  // =========================
+
+  private async generateTimelineAssetsManifest(): Promise<void> {
+    const assets = new Set<string>();
+    const scanned = await this.scanTimelineEntries();
+
+    // include data notes + entry notes + internal images
+    const timelines = new Set<string>();
+    for (const it of scanned) {
+      for (const tl of it.timelines) timelines.add(tl);
+      assets.add(normalizePath(it.entry.notePath));
+      if (it.imgInternal) assets.add(normalizePath(it.imgInternal));
+    }
+
+    for (const tl of timelines) {
+      assets.add(this.timelineDataNotePathForTimelineName(tl));
+    }
+
+    const notePath = this.timelineAssetsNotePath();
+    assets.add(notePath);
+
+    const out = Array.from(assets)
+      .filter(Boolean)
+      .filter((p) => !p.toLowerCase().endsWith(".json"))
+      .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base", numeric: true }));
+
+    await this.ensureFolderFor(notePath);
+
+    const lines: string[] = [];
+    lines.push("---");
+    lines.push("publish: true");
+    lines.push("---");
+    lines.push("");
+    lines.push("# TTRPG Tools: Timeline – Publish assets");
+    lines.push("");
+    lines.push("Generated by **TTRPG Tools: Publish**.");
+    lines.push("Next: **Publish changes** → select this note → **Add linked** → Publish.");
+    lines.push("");
+    lines.push("## Assets");
+    lines.push("");
+    for (const p of out) {
+      const link = p.endsWith(".md") ? p.slice(0, -3) : p;
+      lines.push(`- [[${link}]]`);
+    }
+    lines.push("");
+
+    await this.writeOrUpdateMarkdown(notePath, lines.join("\n"));
+    new Notice(`Generated: ${notePath}`, 15000);
   }
 
   private async generateAssetsManifest(): Promise<void> {
@@ -896,8 +1460,73 @@ class PublishToolsSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
 
+    new Setting(containerEl).setName("Ttrpg tools: timeline").setHeading();
+
     new Setting(containerEl)
-      .setName("Scan mode")
+      .setName("Timeline scan mode")
+      .setDesc("Either all Markdown notes are scanned, or only those with the property publish: true")
+      .addDropdown((d) => {
+        d.addOption("publishTrueOnly", "Only publish: true notes");
+        d.addOption("allMarkdown", "All Markdown notes");
+        d.setValue(this.plugin.settings.timelineScanMode);
+        d.onChange(async (v) => {
+          this.plugin.settings.timelineScanMode = (v === "allMarkdown") ? "allMarkdown" : "publishTrueOnly";
+          await this.plugin.saveSettings();
+        });
+      });
+
+    new Setting(containerEl)
+      .setName("Timeline root folder")
+      .setDesc("Where timeline data notes are generated (must match runtime).")
+      .addText((t) => {
+        t.setPlaceholder("Timeline/publish");
+        t.setValue(this.plugin.settings.timelineRoot);
+        t.onChange(async (v) => {
+          this.plugin.settings.timelineRoot = normalizePath(v.trim() || "Timeline/publish");
+          await this.plugin.saveSettings();
+        });
+      });
+
+    new Setting(containerEl)
+      .setName("Timeline assets manifest note")
+      .setDesc("This note is generated; use publish → add linked on it.")
+      .addText((t) => {
+        t.setPlaceholder("Timeline/publish/assets.md");
+        t.setValue(this.plugin.settings.timelineAssetsNotePath);
+        t.onChange(async (v) => {
+          this.plugin.settings.timelineAssetsNotePath = normalizePath(v.trim() || "Timeline/publish/assets.md");
+          await this.plugin.saveSettings();
+        });
+      });
+	  
+    new Setting(containerEl)
+      .setName("Use custom month names")
+      .setDesc("Use the custom month names from your timeline settings.")
+      .addToggle((t) => {
+        t.setValue(!!this.plugin.settings.timelineUseSimpleTimelineMonths);
+        t.onChange(async (v) => {
+          this.plugin.settings.timelineUseSimpleTimelineMonths = v;
+          await this.plugin.saveSettings();
+        });
+      });
+
+    new Setting(containerEl)
+      .setName("Timeline: month overrides (optional).")
+      .setDesc("Overrides per timeline name. Example:\ntravelbook 1: [januar, februar, ...]")
+      .addTextArea((ta) => {
+        ta.inputEl.rows = 6;
+        ta.setPlaceholder("Travelbook 1:...");
+        ta.setValue(this.plugin.settings.timelineMonthOverridesYaml ?? "");
+        ta.onChange(async (v) => {
+          this.plugin.settings.timelineMonthOverridesYaml = v ?? "";
+          await this.plugin.saveSettings();
+        });
+      });
+	  
+	new Setting(containerEl).setName("Ttrpg tools: maps").setHeading();
+	
+    new Setting(containerEl)
+      .setName("Maps scan mode")
       .setDesc("Either all Markdown notes are scanned, or only those with the property publish: true")
       .addDropdown((d) => {
         d.addOption("publishTrueOnly", "Only publish: true notes");
@@ -944,7 +1573,19 @@ class PublishToolsSettingTab extends PluginSettingTab {
         });
       });
 	  
-    new Setting(containerEl).setName("Hide").setHeading();
+    new Setting(containerEl).setName("Website").setHeading();
+
+    new Setting(containerEl)
+      .setName("Hover popover max width")
+      .setDesc("CSS size value (e.g. 720px, 60rem). Affects page preview popovers on your publish website.")
+      .addText((t) => {
+        t.setPlaceholder("720px");
+        t.setValue(this.plugin.settings.hoverPopoverMaxWidth ?? DEFAULT_SETTINGS.hoverPopoverMaxWidth);
+        t.onChange(async (v) => {
+          this.plugin.settings.hoverPopoverMaxWidth = v ?? "";
+          await this.plugin.saveSettings();
+        });
+      });
 
     new Setting(containerEl)
       .setName("Hide folders in publish navigation")
@@ -957,11 +1598,6 @@ class PublishToolsSettingTab extends PluginSettingTab {
           await this.plugin.saveSettings();
         });
       });
-
-    new Setting(containerEl).setName("Usage").setHeading();
-    new Setting(containerEl).setDesc(
-      "Run: “TTRPG Tools: Maps: Prepare Publish (runtime + data notes + assets)”. Then in Publish changes: publish.js + publish.css + ZoomMap/publish/assets.md → Add linked → Publish.",
-    );
   }
 }
 
