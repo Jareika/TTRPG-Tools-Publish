@@ -10,7 +10,7 @@ import {
 } from "obsidian";
 import type { App } from "obsidian";
 
-import { hashKeyToId, hashPathToId, normalizeForHash } from "./hash";
+import { fnv1a32, hashKeyToId, hashPathToId, normalizeForHash } from "./hash";
 import {
   ZM_BEGIN_CSS,
   ZM_BEGIN_JS,
@@ -25,6 +25,8 @@ type ScanMode = "publishTrueOnly" | "allMarkdown";
 interface PublishToolsSettings {
   scanMode: ScanMode;
   publishRoot: string;       // ZoomMap/publish
+  rasterizeTextLayersToWebp: boolean;
+  textLayerRasterRoot: string; // ZoomMap/publish/textlayers
   assetsNotePath: string;    // ZoomMap/publish/assets.md
   hideNavFolders: string;    // newline or comma separated folder prefixes
   includePinLinkedNotesInAssets: boolean;
@@ -50,6 +52,8 @@ interface PublishToolsSettings {
 const DEFAULT_SETTINGS: PublishToolsSettings = {
   scanMode: "publishTrueOnly",
   publishRoot: "ZoomMap/publish",
+  rasterizeTextLayersToWebp: true,
+  textLayerRasterRoot: "ZoomMap/publish/textlayers",
   assetsNotePath: "ZoomMap/publish/assets.md",
   hideNavFolders: "",
   includePinLinkedNotesInAssets: false,
@@ -75,6 +79,13 @@ function normalizeCssSizeValue(raw: string, fallback: string): string {
   if (!s) return fallback;
   if (/^\d+(\.\d+)?$/.test(s)) return `${s}px`;
   return s;
+}
+
+function setCssProps(el: HTMLElement, props: Record<string, string | null>): void {
+  for (const [key, value] of Object.entries(props)) {
+    if (value === null) el.style.removeProperty(key);
+    else el.style.setProperty(key, value);
+  }
 }
 
 // Minimal interface to call into Zoom Map plugin if installed.
@@ -110,6 +121,15 @@ function readFrontmatter(text: string): Record<string, unknown> | null {
   } catch {
     return null;
   }
+}
+
+function basePathsFromZoommapScan(image: string, imageBases: string[]): string[] {
+  const out: string[] = [];
+  if (typeof image === "string" && image.trim()) out.push(normalizePath(image.trim()));
+  for (const p of imageBases) {
+    if (typeof p === "string" && p.trim()) out.push(normalizePath(p.trim()));
+  }
+  return Array.from(new Set(out.filter(Boolean)));
 }
 
 type LibraryLinkIndex = {
@@ -149,6 +169,8 @@ function splitTimelineNames(raw: unknown): string[] {
 
 export default class TtrpgToolsPublishPlugin extends Plugin {
   settings: PublishToolsSettings = DEFAULT_SETTINGS;
+  
+  private loadedCanvasFonts = new Set<string>();
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -279,6 +301,13 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
     await this.generateTimelineAssetsManifest();
     new Notice("Ttrpg tools: publish: maps + timeline done.", 15000);
   }
+  
+  private textLayerRasterRoot(): string {
+    return normalizePath(
+      (this.settings.textLayerRasterRoot ?? DEFAULT_SETTINGS.textLayerRasterRoot) ||
+        DEFAULT_SETTINGS.textLayerRasterRoot,
+    );
+  }
 
   private async installPublishRuntime(): Promise<void> {
     const jsPath = "publish.js";
@@ -309,6 +338,40 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
 
     new Notice("Publish runtime installed/updated: publish.js + publish.css", 15000);
     new Notice("Reminder: publish.js works only with a custom domain and must be published.", 15000);
+  }
+  
+  private extractMarkerBasePaths(data: Record<string, unknown>, fallback: string[], fromNotePath: string): string[] {
+    const raw = data["bases"];
+    const out: string[] = [];
+
+    const add = (p: unknown) => {
+      if (typeof p !== "string") return;
+      const t = p.trim();
+      if (!t) return;
+      const normTarget = this.normalizeLinkTarget(t);
+      const candidate = normalizePath(normTarget || t);
+      if (!candidate) return;
+
+      const byPath = this.app.vault.getAbstractFileByPath(candidate);
+      if (byPath instanceof TFile) {
+        out.push(byPath.path);
+        return;
+      }
+      const dest = this.app.metadataCache.getFirstLinkpathDest(candidate, fromNotePath);
+      if (dest instanceof TFile) out.push(dest.path);
+      else out.push(candidate);
+    };
+
+    if (Array.isArray(raw)) {
+      for (const it of raw) {
+        if (typeof it === "string") add(it);
+        else if (it && typeof it === "object" && "path" in it) add((it as { path?: unknown }).path);
+      }
+    } else {
+      for (const p of fallback) add(p);
+    }
+
+    return Array.from(new Set(out.filter(Boolean)));
   }
 
   private async upsertRootFileBlock(path: string, begin: string, end: string, block: string): Promise<void> {
@@ -361,6 +424,7 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
     const root = this.publishRoot();
     await this.ensureFolderFor(this.libraryNotePath());
     await this.ensureFolderFor(normalizePath(`${root}/markers/x.md`)); // creates folder
+	await this.ensureFolderFor(normalizePath(`${this.textLayerRasterRoot()}/x.webp`));
 	
     let updatedMarkerNotes = 0;
     let skippedMarkerNotes = 0;
@@ -399,23 +463,85 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
       markerNotePaths.add(notePath);
 	  
       const existing = this.app.vault.getAbstractFileByPath(notePath);
+      let prevMtime: number | undefined = undefined;
+      let prevRasterKey = "";
+      let prevRasterEnabled = false;
+
       if (existing instanceof TFile) {
         const cur = await this.app.vault.read(existing);
         const fm = readFrontmatter(cur);
-        const prevMtime = fmNumber(fm, "zoommapSourceMtime");
-        if (prevMtime !== undefined && sourceMtime !== undefined && prevMtime === sourceMtime) {
+        prevMtime = fmNumber(fm, "zoommapSourceMtime");
+        prevRasterKey = typeof fm?.zoommapTextLayerRasterKey === "string" ? String(fm.zoommapTextLayerRasterKey) : "";
+        prevRasterEnabled = fm?.zoommapTextLayerRasterEnabled === true;
+      }
+
+      const parsedObj = parsed as Record<string, unknown>;
+      const basePaths = this.extractMarkerBasePaths(parsedObj, m.basePaths, m.notePath);
+
+      const sourceChanged =
+        prevMtime !== undefined && sourceMtime !== undefined
+          ? prevMtime !== sourceMtime
+          : true;
+
+      const wantRaster = !!this.settings.rasterizeTextLayersToWebp;
+      let rasterKey = "";
+      let overlayMap: Record<string, string> = {};
+      let rasterFilesMissing = false;
+
+      if (wantRaster) {
+        overlayMap = this.computeTextLayerRasterOutputPaths(markersPath, basePaths, parsedObj);
+        if (Object.keys(overlayMap).length > 0) {
+          const stablePairs = Object.entries(overlayMap).sort((a, b) => a[0].localeCompare(b[0]));
+          rasterKey = fnv1a32(JSON.stringify(stablePairs)).toString(36);
+          rasterFilesMissing = stablePairs.some(([, p]) => !(this.app.vault.getAbstractFileByPath(normalizePath(p)) instanceof TFile));
+
+          if (sourceChanged || rasterFilesMissing || prevRasterKey !== rasterKey || prevRasterEnabled !== true) {
+            await this.rasterizeTextLayersForPublish({
+              markersPath,
+              mapNotePath: m.notePath,
+              basePaths,
+              data: parsedObj,
+            });
+          }
+
+          parsedObj.publishTextLayerOverlays = overlayMap;
+        } else {
+          delete (parsedObj as { publishTextLayerOverlays?: unknown }).publishTextLayerOverlays;
+        }
+      } else {
+        delete (parsedObj as { publishTextLayerOverlays?: unknown }).publishTextLayerOverlays;
+      }
+	  
+      if (existing instanceof TFile) {
+        const sameSource = prevMtime !== undefined && sourceMtime !== undefined && prevMtime === sourceMtime;
+        const sameRaster =
+          (wantRaster
+            ? (prevRasterEnabled === true && prevRasterKey === rasterKey)
+            : (prevRasterEnabled !== true));
+
+        if (sameSource && sameRaster && !rasterFilesMissing) {
           skippedMarkerNotes++;
           continue;
         }
       }
+	  
+      const rasterMeta: Record<string, unknown> = {};
+      if (wantRaster && rasterKey) {
+        rasterMeta.zoommapTextLayerRasterEnabled = true;
+        rasterMeta.zoommapTextLayerRasterKey = rasterKey;
+        rasterMeta.zoommapTextLayerRasterRoot = this.textLayerRasterRoot();
+      } else {
+        rasterMeta.zoommapTextLayerRasterEnabled = false;
+      }
 
       const md = this.wrapJsonAsPublishNote(
         "markers",
-        parsed,
+        parsedObj,
         {
           zoommapMarkersPath: normalizeForHash(markersPath),
           sourceFile: markerJsonFile.path,
           zoommapSourceMtime: sourceMtime,
+		  ...rasterMeta,
         },
       );
 
@@ -436,9 +562,16 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
     const LIB_JSON = this.resolveZoomMapLibraryJsonPath();
     const LIB_NOTE = this.libraryNotePath();
 
-    if (!this.resolveVaultFile(LIB_JSON)) {
-      const zm = this.getZoomMapPluginApi();
-      if (zm) await zm.saveLibraryToPath(LIB_JSON);
+    await this.ensureFolderFor(LIB_JSON);
+
+    const zm = this.getZoomMapPluginApi();
+    if (zm) {
+      try {
+        await zm.saveLibraryToPath(LIB_JSON);
+      } catch (e) {
+        console.warn("TTRPG Tools: Publish: saveLibraryToPath failed.", e);
+        new Notice("Ttrpg tools: publish: failed to export zoom map library.json (see console).", 15000);
+      }
     }
 
     const libFile = this.resolveVaultFile(LIB_JSON);
@@ -982,6 +1115,22 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
     for (const m of maps) {
       await this.addAssetsFromMarkersJson(m.markersPath, assets);
     }
+	
+    if (this.settings.rasterizeTextLayersToWebp) {
+      for (const m of maps) {
+        const markerJsonFile = this.resolveVaultFile(m.markersPath);
+        if (!markerJsonFile) continue;
+        try {
+          const raw = await this.app.vault.read(markerJsonFile);
+          const data = JSON.parse(raw) as Record<string, unknown>;
+          const basePaths = this.extractMarkerBasePaths(data, m.basePaths, m.notePath);
+          const out = this.computeTextLayerRasterOutputPaths(m.markersPath, basePaths, data);
+          for (const p of Object.values(out)) assets.add(normalizePath(p));
+        } catch {
+          // ignore
+        }
+      }
+    }
 
     // Expand assets from library.json (icon files, sticker presets)
     await this.addAssetsFromLibraryJson(this.resolveZoomMapLibraryJsonPath(), assets);
@@ -1025,9 +1174,9 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
     new Notice("Next: Publish changes → select ZoomMap/publish/assets.md → Add linked → Publish.", 15000);
   }
 
-  private async scanZoommaps(): Promise<Array<{ notePath: string; markersPath: string; assetPaths: string[] }>> {
+  private async scanZoommaps(): Promise<Array<{ notePath: string; markersPath: string; assetPaths: string[]; basePaths: string[] }>> {
     const files = this.app.vault.getMarkdownFiles();
-    const out: Array<{ notePath: string; markersPath: string; assetPaths: string[] }> = [];
+    const out: Array<{ notePath: string; markersPath: string; assetPaths: string[]; basePaths: string[] }> = [];
 
     for (const f of files) {
       if (this.settings.scanMode === "publishTrueOnly") {
@@ -1052,6 +1201,9 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
         if (!image) continue;
 
         const markers = this.scalarString(y, "markers") || `${image}.markers.json`;
+		
+        const basesFromYaml = this.parseYamlPathList(y["imageBases"]);
+        const basePaths = basePathsFromZoommapScan(image, basesFromYaml);
 
         const assetPaths: string[] = [];
         assetPaths.push(image);
@@ -1066,12 +1218,15 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
           notePath: f.path,
           markersPath: normalizePath(markers),
           assetPaths,
+		  basePaths,
         });
       }
     }
 
     return out;
   }
+  
+
 
   private extractZoommapCodeblocks(noteText: string): string[] {
     const lines = noteText.split("\n");
@@ -1239,26 +1394,38 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
   
   private getZoomMapPluginApi(): ZoomMapPluginApi | null {
     try {
-      const app = this.app;
-      if (!app) return null;
+      const pluginsAny = (this.app as unknown as { plugins?: unknown }).plugins;
+      if (!isRecord(pluginsAny)) return null;
 
-      const plugins = (app as unknown as { plugins?: unknown }).plugins;
-      if (!isRecord(plugins)) return null;
+      let pl: unknown = null;
+      const getPlugin = pluginsAny["getPlugin"];
+      if (typeof getPlugin === "function") {
+        try {
+          pl = (getPlugin as (id: string) => unknown).call(pluginsAny, "zoom-map");
+        } catch {
+          pl = null;
+        }
+      }
 
-      const maybeZm = (plugins as { getPlugin?: (id: string) => unknown }).getPlugin?.("zoom-map");
-      if (!isRecord(maybeZm)) return null;
+      if (!pl) {
+        const pluginsMap = pluginsAny["plugins"];
+        if (isRecord(pluginsMap)) {
+          pl = pluginsMap["zoom-map"];
+        }
+      }
 
-      const fn = maybeZm.saveLibraryToPath;
+      if (!isRecord(pl)) return null;
+      const fn = pl["saveLibraryToPath"];
       if (typeof fn !== "function") return null;
 
-	  const settings = maybeZm.settings;
+      const settings = pl["settings"];
       const libraryFilePath =
-        isRecord(settings) && typeof settings.libraryFilePath === "string"
-          ? settings.libraryFilePath
+        isRecord(settings) && typeof settings["libraryFilePath"] === "string"
+          ? String(settings["libraryFilePath"])
           : undefined;
 
       return {
-        saveLibraryToPath: (path: string) => (fn as (p: string) => Promise<void>)(path),
+        saveLibraryToPath: (path: string) => (fn as (p: string) => Promise<void>).call(pl, path),
         libraryFilePath,
       };
     } catch (e) {
@@ -1445,7 +1612,240 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
         }
       }
     }
-  } 
+  }
+  private computeTextLayerRasterOutputPaths(
+    markersPath: string,
+    basePaths: string[],
+    markerData: Record<string, unknown>,
+  ): Record<string, string> {
+    const out: Record<string, string> = {};
+    const textLayers = Array.isArray(markerData.textLayers) ? markerData.textLayers : [];
+    if (!textLayers.length) return out;
+
+    const mpId = hashPathToId(markersPath);
+    for (const basePath of basePaths) {
+      const bpTarget = this.normalizeLinkTarget(basePath) || String(basePath ?? "");
+      const bp = normalizePath(bpTarget);
+      if (!bp) continue;
+
+      const relevant = textLayers.some((tl) => {
+        if (!tl || typeof tl !== "object") return false;
+        const bound = (tl as { boundBase?: unknown }).boundBase;
+        if (typeof bound === "string" && bound.trim()) return normalizePath(bound.trim()) === bp;
+        return true;
+      });
+      if (!relevant) continue;
+
+      const baseId = hashPathToId(bp);
+      out[bp] = normalizePath(`${this.textLayerRasterRoot()}/tl-${mpId}-${baseId}.webp`);
+    }
+
+    return out;
+  }
+
+  private async loadImageSize(path: string, fromNotePath: string): Promise<{ w: number; h: number } | null> {
+    const target = this.normalizeLinkTarget(path) || String(path ?? "");
+    if (!target || /^https?:\/\//i.test(target) || /^data:/i.test(target)) return null;
+    const p = normalizePath(target);
+    const byPath = this.app.vault.getAbstractFileByPath(p);
+    const f =
+      byPath instanceof TFile
+        ? byPath
+        : this.app.metadataCache.getFirstLinkpathDest(p, fromNotePath);
+    if (!(f instanceof TFile)) return null;
+
+    const url = this.app.vault.getResourcePath(f);
+    const img = new Image();
+    img.decoding = "async";
+    img.src = url;
+    try {
+      await img.decode();
+    } catch {
+      // ignore
+    }
+
+    const w = img.naturalWidth || 0;
+    const h = img.naturalHeight || 0;
+    if (w > 0 && h > 0) return { w, h };
+    return null;
+  }
+
+  private resolveCssToCanvasColor(color: string): string {
+    const el = document.createElement("span");
+    setCssProps(el, {
+      color,
+      position: "absolute",
+      left: "-10000px",
+      top: "-10000px",
+    });
+    document.body.appendChild(el);
+    const out = window.getComputedStyle(el).color || "#ffffff";
+    el.remove();
+    return out;
+  }
+
+  private resolveCssToCanvasFontFamily(fontFamily: string): string {
+    const el = document.createElement("span");
+    setCssProps(el, {
+      "font-family": fontFamily,
+      position: "absolute",
+      left: "-10000px",
+      top: "-10000px",
+    });
+    document.body.appendChild(el);
+    const out = window.getComputedStyle(el).fontFamily || "sans-serif";
+    el.remove();
+    return out;
+  }
+  
+  private async ensureCanvasFontLoaded(fontSpec: string, sampleText: string): Promise<void> {
+    const spec = String(fontSpec ?? "").trim();
+    if (!spec) return;
+    if (this.loadedCanvasFonts.has(spec)) return;
+
+    const fonts = (document as unknown as { fonts?: unknown }).fonts as
+      | { load?: (font: string, text?: string) => Promise<unknown>; ready?: Promise<unknown> }
+      | undefined;
+
+    if (!fonts || typeof fonts.load !== "function") {
+      this.loadedCanvasFonts.add(spec);
+      return;
+    }
+
+    const sample = String(sampleText ?? "").trim() || "AaBbYyZz 0123456789";
+    const timeout = (ms: number) => new Promise<void>((r) => window.setTimeout(r, ms));
+    try { await Promise.race([fonts.load(spec, sample).then(() => undefined), timeout(1200)]); } catch { /* ignore */ }
+    try { if (fonts.ready) await Promise.race([fonts.ready.then(() => undefined), timeout(1200)]); } catch { /* ignore */ }
+    this.loadedCanvasFonts.add(spec);
+  }
+
+  private async writeWebpToVault(path: string, canvas: HTMLCanvasElement, quality = 0.92): Promise<void> {
+    const dir = normalizePath(path).split("/").slice(0, -1).join("/");
+    if (dir && !this.app.vault.getAbstractFileByPath(dir)) {
+      await this.app.vault.createFolder(dir);
+    }
+
+    const q = Math.min(1, Math.max(0.1, quality));
+    const blob = await new Promise<Blob>((resolve, reject) => {
+      canvas.toBlob((b) => (b ? resolve(b) : reject(new Error("toBlob failed"))), "image/webp", q);
+    });
+
+    const p = normalizePath(path);
+    const buf = await blob.arrayBuffer();
+
+    const anyAdapter = this.app.vault.adapter as unknown as { writeBinary?: (path: string, data: ArrayBuffer) => Promise<void> };
+    if (typeof anyAdapter.writeBinary === "function") {
+      await anyAdapter.writeBinary(p, buf);
+      return;
+    }
+
+    const af = this.app.vault.getAbstractFileByPath(p);
+    if (af instanceof TFile) {
+      // @ts-expect-error modifyBinary exists on newer Obsidian builds
+      await this.app.vault.modifyBinary(af, buf);
+    } else {
+      // @ts-expect-error createBinary exists on newer Obsidian builds
+      await this.app.vault.createBinary(p, buf);
+    }
+  }
+
+  private async rasterizeTextLayersForPublish(args: {
+    markersPath: string;
+    mapNotePath: string;
+    basePaths: string[];
+    data: Record<string, unknown>;
+  }): Promise<Record<string, string>> {
+    const out = this.computeTextLayerRasterOutputPaths(args.markersPath, args.basePaths, args.data);
+    const wanted = Object.entries(out);
+    if (wanted.length === 0) return {};
+
+    const textLayers = Array.isArray(args.data.textLayers) ? args.data.textLayers : [];
+    const size = (args.data.size ?? null) as { w?: unknown; h?: unknown } | null;
+
+    for (const [basePath, outPath] of wanted) {
+      const bp = normalizePath(basePath);
+      if (!bp) continue;
+
+      const sz = await this.loadImageSize(bp, args.mapNotePath);
+      const w =
+        sz?.w ??
+        (typeof size?.w === "number" && Number.isFinite(size.w) ? size.w : 0);
+      const h =
+        sz?.h ??
+        (typeof size?.h === "number" && Number.isFinite(size.h) ? size.h : 0);
+      if (!(w > 0 && h > 0)) continue;
+
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.round(w);
+      canvas.height = Math.round(h);
+      const ctx = canvas.getContext("2d");
+      if (!ctx) continue;
+
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.textBaseline = "alphabetic";
+      ctx.textAlign = "left";
+
+      for (const tl of textLayers) {
+        if (!tl || typeof tl !== "object") continue;
+        const bound = (tl as { boundBase?: unknown }).boundBase;
+        if (typeof bound === "string" && bound.trim()) {
+          if (normalizePath(bound.trim()) !== bp) continue;
+        }
+
+        const style = ((tl as { style?: unknown }).style ?? {}) as Record<string, unknown>;
+        const fontSize = typeof style.fontSize === "number" && Number.isFinite(style.fontSize) && style.fontSize > 1 ? style.fontSize : 14;
+        const fontWeight = typeof style.fontWeight === "string" && style.fontWeight.trim() ? style.fontWeight.trim() : "400";
+        const italic = style.italic === true;
+        const padLeft = typeof style.padLeft === "number" && Number.isFinite(style.padLeft) && style.padLeft >= 0 ? style.padLeft : 0;
+        const colorRaw = typeof style.color === "string" && style.color.trim() ? style.color.trim() : "var(--text-normal)";
+        const fontFamilyRaw = typeof style.fontFamily === "string" && style.fontFamily.trim() ? style.fontFamily.trim() : "var(--font-text)";
+
+        const color = this.resolveCssToCanvasColor(colorRaw);
+        const fontFamily = this.resolveCssToCanvasFontFamily(fontFamilyRaw);
+        ctx.fillStyle = color;
+        const fontSpec = `${italic ? "italic " : ""}${fontWeight} ${fontSize}px ${fontFamily}`;
+
+        const lines = Array.isArray((tl as { lines?: unknown }).lines) ? (tl as { lines: unknown[] }).lines : [];
+        const sampleText = lines
+          .map((ln) => (ln && typeof (ln as { text?: unknown }).text === "string" ? String((ln as { text?: unknown }).text) : ""))
+          .filter((s) => s.trim().length > 0)
+          .join(" ")
+          .slice(0, 280);
+
+        await this.ensureCanvasFontLoaded(fontSpec, sampleText);
+        ctx.font = fontSpec;
+        for (const ln of lines) {
+          if (!ln || typeof ln !== "object") continue;
+          const x0 = (ln as { x0?: unknown }).x0;
+          const y0 = (ln as { y0?: unknown }).y0;
+          const x1 = (ln as { x1?: unknown }).x1;
+          const y1 = (ln as { y1?: unknown }).y1;
+          const text = (ln as { text?: unknown }).text;
+          if (typeof x0 !== "number" || typeof y0 !== "number" || typeof x1 !== "number" || typeof y1 !== "number") continue;
+          const txt = typeof text === "string" ? text.trimEnd() : "";
+          if (!txt) continue;
+
+          const ax0 = x0 * w;
+          const ay0 = y0 * h;
+          const ax1 = x1 * w;
+          const ay1 = y1 * h;
+          const dx = ax1 - ax0;
+          const dy = ay1 - ay0;
+          const angle = Math.atan2(dy, dx);
+
+          ctx.save();
+          ctx.translate(ax0 + padLeft, ay0);
+          if (Math.abs(angle) > 1e-6) ctx.rotate(angle);
+          ctx.fillText(txt, 0, 0);
+          ctx.restore();
+        }
+      }
+
+      await this.writeWebpToVault(outPath, canvas, 0.92);
+    }
+
+    return out;
+  }
 }
 
 class PublishToolsSettingTab extends PluginSettingTab {
@@ -1524,6 +1924,52 @@ class PublishToolsSettingTab extends PluginSettingTab {
       });
 	  
 	new Setting(containerEl).setName("Ttrpg tools: maps").setHeading();
+	
+    new Setting(containerEl)
+      .setName("Rasterize text layers to webp (publish)")
+      .setDesc("Generates per-base transparent webp overlays for text layers, so local fonts don't break layout on publish.")
+      .addToggle((t) => {
+        t.setValue(!!this.plugin.settings.rasterizeTextLayersToWebp);
+        t.onChange(async (v) => {
+          this.plugin.settings.rasterizeTextLayersToWebp = v;
+          await this.plugin.saveSettings();
+        });
+      });
+
+    new Setting(containerEl)
+      .setName("Text layer raster output folder")
+      .setDesc("Vault folder where the generated webp overlays are stored.")
+      .addText((t) => {
+        t.setPlaceholder("Zoommap/publish/textlayers");
+        t.setValue(this.plugin.settings.textLayerRasterRoot ?? DEFAULT_SETTINGS.textLayerRasterRoot);
+        t.onChange(async (v) => {
+          this.plugin.settings.textLayerRasterRoot = normalizePath(v.trim() || DEFAULT_SETTINGS.textLayerRasterRoot);
+          await this.plugin.saveSettings();
+        });
+      });
+	  
+    new Setting(containerEl)
+      .setName("Publish: text layer webp overlays")
+      .setDesc("If enabled, ttrpg tools: publish generates transparent webp overlays per base image for text layers.")
+      .addToggle((t) => {
+        t.setValue(!!this.plugin.settings.rasterizeTextLayersToWebp);
+        t.onChange(async (v) => {
+          this.plugin.settings.rasterizeTextLayersToWebp = v;
+          await this.plugin.saveSettings();
+        });
+      });
+
+    new Setting(containerEl)
+      .setName("Publish: text layer overlay folder")
+      .setDesc("Vault folder where the generated webp overlays are stored.")
+      .addText((t) => {
+        t.setPlaceholder("Zoommap/publish/textlayers");
+        t.setValue(this.plugin.settings.textLayerRasterRoot ?? DEFAULT_SETTINGS.textLayerRasterRoot);
+        t.onChange(async (v) => {
+          this.plugin.settings.textLayerRasterRoot = normalizePath(v.trim() || DEFAULT_SETTINGS.textLayerRasterRoot);
+          await this.plugin.saveSettings();
+        });
+      });
 	
     new Setting(containerEl)
       .setName("Maps scan mode")
