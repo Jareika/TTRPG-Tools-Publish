@@ -1,7 +1,7 @@
 {
   "id": "ttrpg-tools-publish",
   "name": "TTRPG Tools: Publish",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "minAppVersion": "1.9.0",
   "description": "Generates publish.js/publish.css and a publish-assets manifest for TTRPG Tools: Maps and Time.",
   "author": "Jareika",

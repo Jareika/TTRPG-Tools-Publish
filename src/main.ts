@@ -1760,6 +1760,71 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
     if (wanted.length === 0) return {};
 
     const textLayers = Array.isArray(args.data.textLayers) ? args.data.textLayers : [];
+    const mergeStyleRecords = (
+      base: Record<string, unknown>,
+      override: Record<string, unknown>,
+    ): Record<string, unknown> => {
+      return { ...base, ...override };
+    };
+
+    const getRenderableTextBoxes = (
+      layer: unknown,
+    ): Array<{ style: Record<string, unknown>; lines: Record<string, unknown>[] }> => {
+      if (!isRecord(layer)) return [];
+
+      const layerStyle = isRecord(layer.style) ? layer.style : {};
+      const outBoxes: Array<{ style: Record<string, unknown>; lines: Record<string, unknown>[] }> = [];
+
+      const boxesRaw = Array.isArray(layer.boxes) ? layer.boxes : [];
+      if (boxesRaw.length > 0) {
+        for (const box of boxesRaw) {
+          if (!isRecord(box)) continue;
+          const linesRaw = Array.isArray(box.lines) ? box.lines : [];
+          const lines = linesRaw.filter(isRecord);
+          if (!lines.length) continue;
+
+          const boxStyle = isRecord(box.style) ? box.style : {};
+          outBoxes.push({
+            style: mergeStyleRecords(layerStyle, boxStyle),
+            lines,
+          });
+        }
+        return outBoxes;
+      }
+
+      // Legacy fallback: old text layer format with layer.lines
+      const legacyLinesRaw = Array.isArray(layer.lines) ? layer.lines : [];
+      const legacyLines = legacyLinesRaw.filter(isRecord);
+      if (legacyLines.length) {
+        outBoxes.push({
+          style: layerStyle,
+          lines: legacyLines,
+        });
+      }
+
+      return outBoxes;
+    };
+
+    const drawTextWithLetterSpacing = (
+      ctx: CanvasRenderingContext2D,
+      text: string,
+      x: number,
+      y: number,
+      letterSpacing: number,
+    ): void => {
+      if (!text) return;
+      if (!Number.isFinite(letterSpacing) || Math.abs(letterSpacing) < 1e-6) {
+        ctx.fillText(text, x, y);
+        return;
+      }
+
+      let penX = x;
+      for (const ch of text) {
+        ctx.fillText(ch, penX, y);
+        penX += ctx.measureText(ch).width + letterSpacing;
+      }
+    };
+
     const size = (args.data.size ?? null) as { w?: unknown; h?: unknown } | null;
 
     for (const [basePath, outPath] of wanted) {
@@ -1786,58 +1851,101 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
       ctx.textAlign = "left";
 
       for (const tl of textLayers) {
-        if (!tl || typeof tl !== "object") continue;
-        const bound = (tl as { boundBase?: unknown }).boundBase;
+        if (!isRecord(tl)) continue;
+        if (tl.visible === false) continue;
+
+        const bound = tl.boundBase;
         if (typeof bound === "string" && bound.trim()) {
           if (normalizePath(bound.trim()) !== bp) continue;
         }
 
-        const style = ((tl as { style?: unknown }).style ?? {}) as Record<string, unknown>;
-        const fontSize = typeof style.fontSize === "number" && Number.isFinite(style.fontSize) && style.fontSize > 1 ? style.fontSize : 14;
-        const fontWeight = typeof style.fontWeight === "string" && style.fontWeight.trim() ? style.fontWeight.trim() : "400";
-        const italic = style.italic === true;
-        const padLeft = typeof style.padLeft === "number" && Number.isFinite(style.padLeft) && style.padLeft >= 0 ? style.padLeft : 0;
-        const colorRaw = typeof style.color === "string" && style.color.trim() ? style.color.trim() : "var(--text-normal)";
-        const fontFamilyRaw = typeof style.fontFamily === "string" && style.fontFamily.trim() ? style.fontFamily.trim() : "var(--font-text)";
+        const boxes = getRenderableTextBoxes(tl);
+        if (!boxes.length) continue;
 
-        const color = this.resolveCssToCanvasColor(colorRaw);
-        const fontFamily = this.resolveCssToCanvasFontFamily(fontFamilyRaw);
-        ctx.fillStyle = color;
-        const fontSpec = `${italic ? "italic " : ""}${fontWeight} ${fontSize}px ${fontFamily}`;
+        for (const box of boxes) {
+          const style = box.style;
+          const fontSize =
+            typeof style.fontSize === "number" &&
+            Number.isFinite(style.fontSize) &&
+            style.fontSize > 1
+              ? style.fontSize
+              : 14;
 
-        const lines = Array.isArray((tl as { lines?: unknown }).lines) ? (tl as { lines: unknown[] }).lines : [];
-        const sampleText = lines
-          .map((ln) => (ln && typeof (ln as { text?: unknown }).text === "string" ? String((ln as { text?: unknown }).text) : ""))
-          .filter((s) => s.trim().length > 0)
-          .join(" ")
-          .slice(0, 280);
+          const fontWeight =
+            typeof style.fontWeight === "string" && style.fontWeight.trim()
+              ? style.fontWeight.trim()
+              : "400";
 
-        await this.ensureCanvasFontLoaded(fontSpec, sampleText);
-        ctx.font = fontSpec;
-        for (const ln of lines) {
-          if (!ln || typeof ln !== "object") continue;
-          const x0 = (ln as { x0?: unknown }).x0;
-          const y0 = (ln as { y0?: unknown }).y0;
-          const x1 = (ln as { x1?: unknown }).x1;
-          const y1 = (ln as { y1?: unknown }).y1;
-          const text = (ln as { text?: unknown }).text;
-          if (typeof x0 !== "number" || typeof y0 !== "number" || typeof x1 !== "number" || typeof y1 !== "number") continue;
-          const txt = typeof text === "string" ? text.trimEnd() : "";
-          if (!txt) continue;
+          const italic = style.italic === true;
+          const padLeft =
+            typeof style.padLeft === "number" &&
+            Number.isFinite(style.padLeft) &&
+            style.padLeft >= 0
+              ? style.padLeft
+              : 0;
 
-          const ax0 = x0 * w;
-          const ay0 = y0 * h;
-          const ax1 = x1 * w;
-          const ay1 = y1 * h;
-          const dx = ax1 - ax0;
-          const dy = ay1 - ay0;
-          const angle = Math.atan2(dy, dx);
+          const letterSpacing =
+            typeof style.letterSpacing === "number" && Number.isFinite(style.letterSpacing)
+              ? style.letterSpacing
+              : 0;
 
-          ctx.save();
-          ctx.translate(ax0 + padLeft, ay0);
-          if (Math.abs(angle) > 1e-6) ctx.rotate(angle);
-          ctx.fillText(txt, 0, 0);
-          ctx.restore();
+          const colorRaw =
+            typeof style.color === "string" && style.color.trim()
+              ? style.color.trim()
+              : "var(--text-normal)";
+
+          const fontFamilyRaw =
+            typeof style.fontFamily === "string" && style.fontFamily.trim()
+              ? style.fontFamily.trim()
+              : "var(--font-text)";
+
+          const color = this.resolveCssToCanvasColor(colorRaw);
+          const fontFamily = this.resolveCssToCanvasFontFamily(fontFamilyRaw);
+          const fontSpec = `${italic ? "italic " : ""}${fontWeight} ${fontSize}px ${fontFamily}`;
+
+          const sampleText = box.lines
+            .map((ln) => (typeof ln.text === "string" ? ln.text : ""))
+            .filter((s) => s.trim().length > 0)
+            .join(" ")
+            .slice(0, 280);
+
+          await this.ensureCanvasFontLoaded(fontSpec, sampleText);
+          ctx.font = fontSpec;
+          ctx.fillStyle = color;
+
+          for (const ln of box.lines) {
+            const x0 = ln.x0;
+            const y0 = ln.y0;
+            const x1 = ln.x1;
+            const y1 = ln.y1;
+            const text = ln.text;
+
+            if (
+              typeof x0 !== "number" ||
+              typeof y0 !== "number" ||
+              typeof x1 !== "number" ||
+              typeof y1 !== "number"
+            ) {
+              continue;
+            }
+
+            const txt = typeof text === "string" ? text.trimEnd() : "";
+            if (!txt) continue;
+
+            const ax0 = x0 * w;
+            const ay0 = y0 * h;
+            const ax1 = x1 * w;
+            const ay1 = y1 * h;
+            const dx = ax1 - ax0;
+            const dy = ay1 - ay0;
+            const angle = Math.atan2(dy, dx);
+
+            ctx.save();
+            ctx.translate(ax0 + padLeft, ay0);
+            if (Math.abs(angle) > 1e-6) ctx.rotate(angle);
+            drawTextWithLetterSpacing(ctx, txt, 0, 0, letterSpacing);
+            ctx.restore();
+          }
         }
       }
 
