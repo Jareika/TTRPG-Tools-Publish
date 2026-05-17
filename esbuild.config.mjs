@@ -15,7 +15,7 @@ mkdirSync("dist", { recursive: true });
 const opts = {
   entryPoints: ["src/main.ts"],
   bundle: true,
-  outfile: "dist/main.js",
+  outfile: "main.js",
   format: "cjs",
   target: "es2020",
   platform: "browser",

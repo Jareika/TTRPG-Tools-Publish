@@ -32,7 +32,7 @@ jobs:
 
       - name: Verify build outputs exist
         run: |
-          test -f dist/main.js
+          test -f main.js
           test -f manifest.json
           if [ -f styles.css ]; then echo "styles.css found"; else echo "styles.css not found, continuing"; fi
 
@@ -40,7 +40,7 @@ jobs:
         uses: actions/attest@v4
         with:
           subject-path: |
-            dist/main.js
+            main.js
             manifest.json
 
       - name: Generate artifact attestation for styles.css
@@ -55,7 +55,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release create "${GITHUB_REF_NAME}" \
-            dist/main.js \
+            main.js \
             manifest.json \
             --generate-notes
 
@@ -65,7 +65,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release create "${GITHUB_REF_NAME}" \
-            dist/main.js \
+            main.js \
             manifest.json \
             styles.css \
             --generate-notes
