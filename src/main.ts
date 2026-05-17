@@ -913,12 +913,13 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
 
     for (const f of files) {
       if (this.settings.timelineScanMode === "publishTrueOnly") {
-        const fmPub = this.app.metadataCache.getFileCache(f)?.frontmatter as Record<string, unknown> | undefined;
-        if (fmPub?.publish !== true) continue;
+        const fmPubUnknown: unknown = this.app.metadataCache.getFileCache(f)?.frontmatter;
+        if (!isRecord(fmPubUnknown) || fmPubUnknown.publish !== true) continue;
       }
 
-      const fm = this.app.metadataCache.getFileCache(f)?.frontmatter as Record<string, unknown> | undefined;
-      if (!fm) continue;
+      const fmUnknown: unknown = this.app.metadataCache.getFileCache(f)?.frontmatter;
+      if (!isRecord(fmUnknown)) continue;
+      const fm = fmUnknown;
 
       const start = this.parseFcDate(fm[dateKey]);
       if (!start) continue;
@@ -1181,7 +1182,7 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
 
     for (const f of files) {
       if (this.settings.scanMode === "publishTrueOnly") {
-        const fm = this.app.metadataCache.getFileCache(f)?.frontmatter as Record<string, unknown> | undefined;
+        const fm = this.app.metadataCache.getFileCache(f)?.frontmatter;
         if (fm?.publish !== true) continue;
       }
 
@@ -1841,7 +1842,7 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
       }
     };
 
-    const size = (args.data.size ?? null) as { w?: unknown; h?: unknown } | null;
+    const size = isRecord(args.data.size) ? args.data.size : null;
 
     for (const [basePath, outPath] of wanted) {
       const bp = normalizePath(basePath);
