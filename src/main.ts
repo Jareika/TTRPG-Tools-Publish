@@ -928,7 +928,8 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
 
       const end = fm[endKey] ? this.parseFcDate(fm[endKey]) ?? undefined : undefined;
 
-      const title = typeof fm[titleKey] === "string" && fm[titleKey].trim() ? fm[titleKey].trim() : f.basename;
+      const titleValue = fm[titleKey];
+      const title = typeof titleValue === "string" && titleValue.trim().length > 0 ? titleValue.trim() : f.basename;
 
       let summary: string | undefined;
       // Important: allow "intentionally empty" summaries:
@@ -1669,31 +1670,37 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
     if (w > 0 && h > 0) return { w, h };
     return null;
   }
+  
+  private getCompatibleDocument(): Document {
+    const g = globalThis as typeof globalThis & { activeDocument?: Document };
+    if (g.activeDocument) return g.activeDocument;
+    return document;
+  }
 
   private resolveCssToCanvasColor(color: string): string {
-    const el = document.createElement("span");
+    const doc = this.getCompatibleDocument();
+    const el = doc.body.createSpan();
     setCssProps(el, {
       color,
       position: "absolute",
       left: "-10000px",
       top: "-10000px",
     });
-    document.body.appendChild(el);
-    const out = window.getComputedStyle(el).color || "#ffffff";
+    const out = doc.defaultView?.getComputedStyle(el).color || "#ffffff";
     el.remove();
     return out;
   }
 
   private resolveCssToCanvasFontFamily(fontFamily: string): string {
-    const el = document.createElement("span");
+    const doc = this.getCompatibleDocument();
+    const el = doc.body.createSpan();
     setCssProps(el, {
       "font-family": fontFamily,
       position: "absolute",
       left: "-10000px",
       top: "-10000px",
     });
-    document.body.appendChild(el);
-    const out = window.getComputedStyle(el).fontFamily || "sans-serif";
+    const out = doc.defaultView?.getComputedStyle(el).fontFamily || "sans-serif";
     el.remove();
     return out;
   }
@@ -1702,8 +1709,9 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
     const spec = String(fontSpec ?? "").trim();
     if (!spec) return;
     if (this.loadedCanvasFonts.has(spec)) return;
+	 const doc = this.getCompatibleDocument();
 
-    const fonts = (document as unknown as { fonts?: unknown }).fonts as
+    const fonts = (doc as Document & { fonts?: FontFaceSet }).fonts as
       | { load?: (font: string, text?: string) => Promise<unknown>; ready?: Promise<unknown> }
       | undefined;
 
@@ -1747,6 +1755,14 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
       // @ts-expect-error createBinary exists on newer Obsidian builds
       await this.app.vault.createBinary(p, buf);
     }
+  }
+  
+  private createDetachedCanvas(): HTMLCanvasElement {
+    const doc = this.getCompatibleDocument();
+    const wrapper = doc.body.createDiv();
+    const canvas = wrapper.createEl("canvas");
+    wrapper.remove();
+    return canvas;
   }
 
   private async rasterizeTextLayersForPublish(args: {
@@ -1840,7 +1856,7 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
         (typeof size?.h === "number" && Number.isFinite(size.h) ? size.h : 0);
       if (!(w > 0 && h > 0)) continue;
 
-      const canvas = document.createElement("canvas");
+      const canvas = this.createDetachedCanvas();
       canvas.width = Math.round(w);
       canvas.height = Math.round(h);
       const ctx = canvas.getContext("2d");

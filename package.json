@@ -7,14 +7,35 @@
     "build": "node esbuild.config.mjs production",
     "dev": "node esbuild.config.mjs watch",
     "lint": "eslint src",
-    "lint:fix": "eslint src --fix"
+    "lint:fix": "eslint src --fix",
+    "audit": "npm audit",
+    "audit:json": "npm audit --json",
+    "deps:check": "npm ls minimatch ajv flatted brace-expansion picomatch yaml"
+  },
+  "overrides": {
+    "eslint": {
+      "minimatch": "3.1.4",
+      "ajv": "6.14.0",
+      "flatted": "3.4.2",
+      "brace-expansion": "1.1.13"
+    },
+    "@typescript-eslint/eslint-plugin": {
+      "minimatch": "9.0.7",
+      "brace-expansion": "2.0.3",
+      "picomatch": "4.0.4"
+    },
+    "eslint-plugin-obsidianmd": {
+      "minimatch": "8.0.6",
+      "ajv": "8.18.0",
+      "yaml": "2.8.3"
+    }
   },
   "devDependencies": {
     "@eslint/js": "^9.39.1",
     "@types/node": "^20.11.30",
     "@typescript-eslint/eslint-plugin": "^8.48.0",
     "@typescript-eslint/parser": "^8.48.0",
-    "esbuild": "^0.21.5",
+    "esbuild": "^0.28.0",
     "eslint": "^9.39.1",
     "eslint-plugin-obsidianmd": "^0.1.9",
     "globals": "^16.5.0",
