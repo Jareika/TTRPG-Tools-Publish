@@ -1,4 +1,4 @@
-# TTRPG Tools: Publish (Obsidian Plugin)
+# TTRPG Tools - Publish (Obsidian Plugin)
 
 **TTRPG Tools: Publish** is a helper plugin for people who publish their vault as a website (Obsidian Publish).
 It prepares content from:
