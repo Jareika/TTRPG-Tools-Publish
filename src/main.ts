@@ -1116,6 +1116,7 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
     // Expand assets by reading marker json (stickers, baked svg, overlays, bases)
     for (const m of maps) {
       await this.addAssetsFromMarkersJson(m.markersPath, assets);
+	  await this.addLinkedNotesFromDrawingsJson(m.markersPath, m.notePath, assets);
     }
 	
     if (this.settings.rasterizeTextLayersToWebp) {
@@ -1615,6 +1616,41 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
       }
     }
   }
+  
+  private async addLinkedNotesFromDrawingsJson(
+    markersPath: string,
+    fromNotePath: string,
+    assets: Set<string>,
+  ): Promise<void> {
+    const af = this.resolveVaultFile(markersPath);
+    if (!af) return;
+
+    let data: Record<string, unknown>;
+    try {
+      const raw = await this.app.vault.read(af);
+      data = JSON.parse(raw) as Record<string, unknown>;
+    } catch {
+      return;
+    }
+
+    const addLink = (rawLink: string) => {
+      const p = this.resolveLinkedNotePath(rawLink, fromNotePath);
+      if (p) assets.add(normalizePath(p));
+    };
+
+    const drawings = Array.isArray(data.drawings) ? (data.drawings as unknown[]) : [];
+    for (const dd of drawings) {
+      if (!dd || typeof dd !== "object") continue;
+      const style = (dd as { style?: unknown }).style;
+      if (!style || typeof style !== "object") continue;
+
+      const regionLink = (style as { regionLink?: unknown }).regionLink;
+      if (typeof regionLink === "string" && regionLink.trim()) {
+        addLink(regionLink);
+      }
+    }
+  }
+
   private computeTextLayerRasterOutputPaths(
     markersPath: string,
     basePaths: string[],
