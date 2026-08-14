@@ -596,17 +596,14 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
     let text = "";
 
     if (exists) {
-      // @ts-expect-error adapter.read exists
       text = await adapter.read(p);
     }
 
     const next = this.upsertBlock(text, begin, end, block);
 
     if (!exists) {
-      // @ts-expect-error adapter.write exists
       await adapter.write(p, next);
     } else if (text !== next) {
-      // @ts-expect-error adapter.write exists
       await adapter.write(p, next);
     }
   }
@@ -1998,10 +1995,8 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
 
     const af = this.app.vault.getAbstractFileByPath(p);
     if (af instanceof TFile) {
-      // @ts-expect-error modifyBinary exists on newer Obsidian builds
       await this.app.vault.modifyBinary(af, buf);
     } else {
-      // @ts-expect-error createBinary exists on newer Obsidian builds
       await this.app.vault.createBinary(p, buf);
     }
   }
