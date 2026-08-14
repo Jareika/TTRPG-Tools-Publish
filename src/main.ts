@@ -7,6 +7,7 @@ import {
   TFolder,
   normalizePath,
   parseYaml,
+  type SettingDefinitionItem,
 } from "obsidian";
 import type { App } from "obsidian";
 
@@ -21,6 +22,32 @@ import {
 } from "./publishTemplates";
 
 type ScanMode = "publishTrueOnly" | "allMarkdown";
+
+const CONTROLS_PROVIDER_API_VERSION = 1;
+const CONTROLS_PROVIDER_ID = "ttrpg-tools-publish";
+const OBSIDIAN_PUBLISH_VIEW_CHANGES_COMMAND_ID = "publish:view-changes";
+
+interface ControlsProviderAction {
+  id: string;
+  name: string;
+  icon: string;
+  group: string;
+  description?: string;
+  available: boolean;
+}
+
+interface ControlsProviderApi {
+  apiVersion: typeof CONTROLS_PROVIDER_API_VERSION;
+  providerId: string;
+  providerName: string;
+  getActions(): ControlsProviderAction[];
+  executeAction(actionId: string): Promise<void>;
+}
+
+interface CommandManagerLike {
+  commands?: Record<string, unknown>;
+  executeCommandById?: (commandId: string) => boolean;
+}
 
 interface PublishToolsSettings {
   scanMode: ScanMode;
@@ -171,6 +198,23 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
   settings: PublishToolsSettings = DEFAULT_SETTINGS;
   
   private loadedCanvasFonts = new Set<string>();
+  
+  /**
+   * Public interface for TTRPG Tools – Controls.
+   *
+   * Controls rely exclusively on these user‑facing actions and do not need
+   * to know any internal publish functions or settings structures.
+   */
+
+  readonly controlsApi: ControlsProviderApi = {
+    apiVersion: CONTROLS_PROVIDER_API_VERSION,
+    providerId: CONTROLS_PROVIDER_ID,
+    providerName: "TTRPG Tools - Publish",
+    getActions: () => this.getControlsActions(),
+    executeAction: async (actionId) => {
+      await this.executeControlsAction(actionId);
+    },
+  };
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -233,6 +277,176 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
 
   async saveSettings(): Promise<void> {
     await this.saveData(this.settings);
+  }
+  
+  private getControlsActions(): ControlsProviderAction[] {
+    return [
+      {
+        id: "obsidian-publish.changes.open",
+        name: "Open Obsidian Publish changes",
+        icon: "send",
+        group: "Obsidian Publish",
+        description: "Open the Obsidian Publish changes dialog.",
+        available: this.canExecuteObsidianPublishChangesCommand(),
+      },
+      {
+        id: "settings.open",
+        name: "Open Publish settings",
+        icon: "settings",
+        group: "Management",
+        description: "Open the settings for TTRPG Tools - Publish.",
+        available: true,
+      },
+      {
+        id: "runtime.install",
+        name: "Install or update Publish runtime",
+        icon: "refresh-cw",
+        group: "Runtime",
+        description: "Generate or update publish.js and publish.css.",
+        available: true,
+      },
+      {
+        id: "maps.data.generate",
+        name: "Generate Maps Publish data",
+        icon: "map",
+        group: "Maps",
+        description: "Generate Publish library and marker data notes.",
+        available: true,
+      },
+      {
+        id: "maps.assets.generate",
+        name: "Generate Maps asset manifest",
+        icon: "package",
+        group: "Maps",
+        description: "Generate the Maps Publish asset manifest note.",
+        available: true,
+      },
+      {
+        id: "maps.prepare",
+        name: "Prepare Maps for Publish",
+        icon: "send",
+        group: "Maps",
+        description: "Generate runtime, Maps data notes, and the asset manifest.",
+        available: true,
+      },
+      {
+        id: "timeline.data.generate",
+        name: "Generate Timeline Publish data",
+        icon: "git-branch",
+        group: "Timeline",
+        description: "Generate Publish timeline data notes.",
+        available: true,
+      },
+      {
+        id: "timeline.assets.generate",
+        name: "Generate Timeline asset manifest",
+        icon: "package",
+        group: "Timeline",
+        description: "Generate the Timeline Publish asset manifest note.",
+        available: true,
+      },
+      {
+        id: "timeline.prepare",
+        name: "Prepare Timeline for Publish",
+        icon: "send",
+        group: "Timeline",
+        description: "Generate runtime, Timeline data notes, and the asset manifest.",
+        available: true,
+      },
+      {
+        id: "all.prepare",
+        name: "Prepare Maps and Timeline for Publish",
+        icon: "rocket",
+        group: "Publish",
+        description: "Generate runtime, Maps data, Timeline data, and both asset manifests.",
+        available: true,
+      },
+    ];
+  }
+
+  private async executeControlsAction(actionId: string): Promise<void> {
+    switch (actionId) {
+      case "obsidian-publish.changes.open":
+        this.openObsidianPublishChanges();
+        return;
+      case "settings.open":
+        this.openPluginSettings();
+        return;
+      case "runtime.install":
+        await this.installPublishRuntime();
+        return;
+      case "maps.data.generate":
+        await this.generatePublishDataNotes();
+        return;
+      case "maps.assets.generate":
+        await this.generateAssetsManifest();
+        return;
+      case "maps.prepare":
+        await this.prepareAll();
+        return;
+      case "timeline.data.generate":
+        await this.generateTimelineDataNotes();
+        return;
+      case "timeline.assets.generate":
+        await this.generateTimelineAssetsManifest();
+        return;
+      case "timeline.prepare":
+        await this.prepareTimelineOnly();
+        return;
+      case "all.prepare":
+        await this.prepareMapsAndTimeline();
+        return;
+      default:
+        throw new Error(`Unknown Publish Controls action: ${actionId}`);
+    }
+  }
+  
+  private getCommandManager(): CommandManagerLike | null {
+    const appWithCommands = this.app as unknown as {
+      commands?: CommandManagerLike;
+    };
+
+    return appWithCommands.commands ?? null;
+  }
+
+  private canExecuteObsidianPublishChangesCommand(): boolean {
+    const commands = this.getCommandManager();
+
+    return !!commands?.executeCommandById &&
+      !!commands.commands?.[OBSIDIAN_PUBLISH_VIEW_CHANGES_COMMAND_ID];
+  }
+
+  private openObsidianPublishChanges(): void {
+    const commands = this.getCommandManager();
+
+    if (
+      !commands?.executeCommandById ||
+      !commands.commands?.[OBSIDIAN_PUBLISH_VIEW_CHANGES_COMMAND_ID]
+    ) {
+      throw new Error(
+        "The Obsidian Publish command is unavailable. Enable the Publish core plugin first."
+      );
+    }
+
+    const executed = commands.executeCommandById(
+      OBSIDIAN_PUBLISH_VIEW_CHANGES_COMMAND_ID
+    );
+
+    if (!executed) {
+      throw new Error("Could not open the Obsidian Publish changes dialog.");
+    }
+  }
+
+  private openPluginSettings(): void {
+    const appWithSettings = this.app as unknown as {
+      setting?: {
+        open: () => void;
+        openTabById: (id: string) => void;
+      };
+    };
+
+    appWithSettings.setting?.open();
+    appWithSettings.setting?.openTabById(this.manifest.id);
   }
 
   private publishRoot(): string {
@@ -1709,9 +1923,7 @@ export default class TtrpgToolsPublishPlugin extends Plugin {
   }
   
   private getCompatibleDocument(): Document {
-    const g = globalThis as typeof globalThis & { activeDocument?: Document };
-    if (g.activeDocument) return g.activeDocument;
-    return document;
+    return activeDocument;
   }
 
   private resolveCssToCanvasColor(color: string): string {
@@ -2016,6 +2228,252 @@ class PublishToolsSettingTab extends PluginSettingTab {
     super(app, plugin);
     this.plugin = plugin;
   }
+  
+  getSettingDefinitions(): SettingDefinitionItem[] {
+
+    return [
+      {
+        type: "group",
+        heading: "TTRPG Tools: Timeline",
+        items: [
+          {
+            name: "Timeline scan mode",
+            desc: "Either all Markdown notes are scanned, or only those with the property publish: true.",
+            control: {
+              type: "dropdown",
+              key: "timelineScanMode",
+              options: {
+                publishTrueOnly: "Only publish: true notes",
+                allMarkdown: "All Markdown notes",
+              },
+            },
+          },
+          {
+            name: "Timeline root folder",
+            desc: "Where timeline data notes are generated. This must match the generated runtime.",
+            control: {
+              type: "text",
+              key: "timelineRoot",
+              placeholder: "Timeline/publish",
+            },
+          },
+          {
+            name: "Timeline assets manifest note",
+            desc: "This generated note can be selected in Publish changes and expanded with Add linked.",
+            control: {
+              type: "text",
+              key: "timelineAssetsNotePath",
+              placeholder: "Timeline/publish/assets.md",
+            },
+          },
+          {
+            name: "Use custom month names",
+            desc: "Use custom month names from TTRPG Tools: Timeline when available.",
+            control: {
+              type: "toggle",
+              key: "timelineUseSimpleTimelineMonths",
+            },
+          },
+          {
+            name: "Timeline month overrides",
+            desc: "Optional YAML overrides per timeline name. Example: Travelbook 1: [January, February].",
+            control: {
+              type: "textarea",
+              key: "timelineMonthOverridesYaml",
+              placeholder: "Travelbook 1: [January, February, ...]",
+              rows: 6,
+            },
+          },
+        ],
+      },
+      {
+        type: "group",
+        heading: "TTRPG Tools: Maps",
+        items: [
+          {
+            name: "Rasterize text layers to WebP",
+            desc: "Generate transparent per-base WebP overlays for text layers.",
+            control: {
+              type: "toggle",
+              key: "rasterizeTextLayersToWebp",
+            },
+          },
+          {
+            name: "Text layer raster output folder",
+            desc: "Vault folder where generated text-layer WebP overlays are stored.",
+            control: {
+              type: "text",
+              key: "textLayerRasterRoot",
+              placeholder: "ZoomMap/publish/textlayers",
+            },
+          },
+          {
+            name: "Maps scan mode",
+            desc: "Either all Markdown notes are scanned, or only those with the property publish: true.",
+            control: {
+              type: "dropdown",
+              key: "scanMode",
+              options: {
+                publishTrueOnly: "Only publish: true notes",
+                allMarkdown: "All Markdown notes",
+              },
+            },
+          },
+          {
+            name: "Publish data root folder",
+            desc: "All generated Maps Publish data notes are written here.",
+            control: {
+              type: "text",
+              key: "publishRoot",
+              placeholder: "ZoomMap/publish",
+            },
+          },
+          {
+            name: "Maps assets manifest note path",
+            desc: "Generated note containing links to all Maps Publish assets.",
+            control: {
+              type: "text",
+              key: "assetsNotePath",
+              placeholder: "ZoomMap/publish/assets.md",
+            },
+          },
+          {
+            name: "Include linked notes from pins",
+            desc: "Include notes linked by map markers and drawing regions in the Maps asset manifest.",
+            control: {
+              type: "toggle",
+              key: "includePinLinkedNotesInAssets",
+            },
+          },
+        ],
+      },
+      {
+        type: "group",
+        heading: "Website",
+        items: [
+          {
+            name: "Hover popover max width",
+            desc: "CSS size value, for example 720px or 60rem.",
+            control: {
+              type: "text",
+              key: "hoverPopoverMaxWidth",
+              placeholder: "720px",
+            },
+          },
+          {
+            name: "Hide folders in Publish navigation",
+            desc: "One folder prefix per line or comma separated. Notes remain published.",
+            control: {
+              type: "textarea",
+              key: "hideNavFolders",
+              placeholder: "GM/secrets\narchive",
+              rows: 4,
+            },
+          },
+        ],
+      },
+    ];
+  }
+  
+  override async setControlValue(
+    key: string,
+    value: unknown
+  ): Promise<void> {
+    switch (key) {
+      case "scanMode":
+        if (value === "publishTrueOnly" || value === "allMarkdown") {
+          this.plugin.settings.scanMode = value;
+        }
+        break;
+
+      case "publishRoot":
+        if (typeof value === "string") {
+          this.plugin.settings.publishRoot = normalizePath(
+            value.trim() || DEFAULT_SETTINGS.publishRoot
+          );
+        }
+        break;
+
+      case "rasterizeTextLayersToWebp":
+        if (typeof value === "boolean") {
+          this.plugin.settings.rasterizeTextLayersToWebp = value;
+        }
+        break;
+
+      case "textLayerRasterRoot":
+        if (typeof value === "string") {
+          this.plugin.settings.textLayerRasterRoot = normalizePath(
+            value.trim() || DEFAULT_SETTINGS.textLayerRasterRoot
+          );
+        }
+        break;
+
+      case "assetsNotePath":
+        if (typeof value === "string") {
+          this.plugin.settings.assetsNotePath = normalizePath(
+            value.trim() || DEFAULT_SETTINGS.assetsNotePath
+          );
+        }
+        break;
+
+      case "hideNavFolders":
+        if (typeof value === "string") {
+          this.plugin.settings.hideNavFolders = value;
+        }
+        break;
+
+      case "includePinLinkedNotesInAssets":
+        if (typeof value === "boolean") {
+          this.plugin.settings.includePinLinkedNotesInAssets = value;
+        }
+        break;
+
+      case "hoverPopoverMaxWidth":
+        if (typeof value === "string") {
+          this.plugin.settings.hoverPopoverMaxWidth = value;
+        }
+        break;
+
+      case "timelineScanMode":
+        if (value === "publishTrueOnly" || value === "allMarkdown") {
+          this.plugin.settings.timelineScanMode = value;
+        }
+        break;
+
+      case "timelineRoot":
+        if (typeof value === "string") {
+          this.plugin.settings.timelineRoot = normalizePath(
+            value.trim() || DEFAULT_SETTINGS.timelineRoot
+          );
+        }
+        break;
+
+      case "timelineAssetsNotePath":
+        if (typeof value === "string") {
+          this.plugin.settings.timelineAssetsNotePath = normalizePath(
+            value.trim() || DEFAULT_SETTINGS.timelineAssetsNotePath
+          );
+        }
+        break;
+
+      case "timelineUseSimpleTimelineMonths":
+        if (typeof value === "boolean") {
+          this.plugin.settings.timelineUseSimpleTimelineMonths = value;
+        }
+        break;
+
+      case "timelineMonthOverridesYaml":
+        if (typeof value === "string") {
+          this.plugin.settings.timelineMonthOverridesYaml = value;
+        }
+        break;
+
+      default:
+        return;
+    }
+
+    await this.plugin.saveSettings();
+  }
 
   display(): void {
     const { containerEl } = this;
@@ -2109,29 +2567,6 @@ class PublishToolsSettingTab extends PluginSettingTab {
         });
       });
 	  
-    new Setting(containerEl)
-      .setName("Publish: text layer webp overlays")
-      .setDesc("If enabled, ttrpg tools: publish generates transparent webp overlays per base image for text layers.")
-      .addToggle((t) => {
-        t.setValue(!!this.plugin.settings.rasterizeTextLayersToWebp);
-        t.onChange(async (v) => {
-          this.plugin.settings.rasterizeTextLayersToWebp = v;
-          await this.plugin.saveSettings();
-        });
-      });
-
-    new Setting(containerEl)
-      .setName("Publish: text layer overlay folder")
-      .setDesc("Vault folder where the generated webp overlays are stored.")
-      .addText((t) => {
-        t.setPlaceholder("Zoommap/publish/textlayers");
-        t.setValue(this.plugin.settings.textLayerRasterRoot ?? DEFAULT_SETTINGS.textLayerRasterRoot);
-        t.onChange(async (v) => {
-          this.plugin.settings.textLayerRasterRoot = normalizePath(v.trim() || DEFAULT_SETTINGS.textLayerRasterRoot);
-          await this.plugin.saveSettings();
-        });
-      });
-	
     new Setting(containerEl)
       .setName("Maps scan mode")
       .setDesc("Either all Markdown notes are scanned, or only those with the property publish: true")
